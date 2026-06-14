@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      - name: Check Python syntax
+        run: |
+          python -m py_compile app.py
+          python -m py_compile main.py
+          python -m py_compile bot/discord_bot.py
+          python -m py_compile bot/analyzer_service.py
+          python -m py_compile bot/llm_prompts.py
+          python -m py_compile modeling/model_training.py
+          python -m py_compile modeling/backtesting.py
+          python -m py_compile data_pipeline/feature_engineering.py
+          python -m py_compile data_pipeline/clean_data.py
+          python -m py_compile scraping/scraper.py
+          python -m py_compile scraping/live_scraper.py
+          python -m py_compile scraping/backfill_sectional_times.py
+      - name: Check for leaked secrets
+        run: |
+          if grep -rq "AIzaSy\|97213021\|c93fa7ca670c\|MTQ1.*\." --include="*.py" --include="*.md" --include="*.json" .; then
+            echo "❌ POTENTIAL SECRET LEAK DETECTED!" && exit 1
+          fi
+          echo "✅ No secrets found"

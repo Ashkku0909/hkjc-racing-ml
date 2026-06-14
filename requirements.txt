@@ -1,0 +1,12 @@
+playwright
+sqlalchemy
+asyncpg
+pandas
+psycopg2-binary
+lightgbm
+scikit-learn
+discord.py
+python-dotenv
+google-genai
+streamlit
+matplotlib
