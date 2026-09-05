@@ -3,6 +3,7 @@ import numpy as np
 import logging
 import os
 import glob
+import re
 
 # --- Configuration & Setup ---
 logging.basicConfig(
@@ -10,6 +11,72 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# --- Forgive-Flag Keyword Dictionaries (English + Chinese) ---
+BLOCKED_KEYWORDS = [
+    "held up", "denied clear run", "checked", "severely checked",
+    "bumped heavily", "blocked", "受阻", "勒避", "受困"
+]
+WIDE_NO_COVER_KEYWORDS = [
+    "raced wide without cover", "wide throughout", "without cover",
+    "全程走外疊", "走外疊", "無遮擋"
+]
+BAD_START_KEYWORDS = [
+    "slow to begin", "bounded in the air", "knuckled", "slow into stride",
+    "出閘緩慢", "慢閘", "閘內跪低"
+]
+
+# --- Deterministic HKJC Apprentice Claim Imputation ---
+# Official ladder (wins-to-date at race time):
+#   0-19 wins  -> 10 lb claim
+#   20-44 wins -> 7 lb
+#   45-69 wins -> 5 lb
+#   70-94 wins -> 3 lb
+#   95+ wins   -> graduated (0)
+# APPRENTICE_PRIOR_WINS holds each apprentice's career HK wins before the
+# data window (2020-01-01), so the ladder is seeded correctly for riders
+# whose claim milestone was reached before our CSV history begins.
+APPRENTICE_PRIOR_WINS = {
+    'C L Chau': 5,      # debut 2019/20 season
+    'M F Poon': 45,     # claimed 5 lb entering 2020, graduated later
+    'K H Chan': 24,     # A K Chan: 7 lb claim entering 2020
+    'H T Mo': 40,       # 5 lb claim entering 2020
+    'Y L Chung': 0,     # Angus Chung: debut 2022/23
+    'E C W Wong': 0,    # Ellis Wong: debut 2022/23
+    'P N Wong': 0,      # debut 2024/25
+    'H N Wong': 28,     # 7 lb claim entering 2020
+    'C Wong': 30,       # Victor Wong: 7 lb claim entering 2020
+}
+
+
+def claim_from_wins(wins: float) -> int:
+    """HKJC apprentice claim ladder as a pure function of career wins."""
+    if wins < 20:
+        return 10
+    if wins < 45:
+        return 7
+    if wins < 70:
+        return 5
+    if wins < 95:
+        return 3
+    return 0
+
+
+# Typical handicap band width per class (used for implied-rating fallback).
+CLASS_BAND_WIDTHS = {
+    'class 1': 15, 'class 2': 20, 'class 3': 20,
+    'class 4': 20, 'class 5': 15,
+}
+# Typical class ceiling when the scraped band is unavailable.
+CLASS_FALLBACK_MAX = {
+    'class 1': 105, 'class 2': 100, 'class 3': 80,
+    'class 4': 60, 'class 5': 40,
+}
+
+def _text_contains_flags(text_series: pd.Series, keywords: list) -> pd.Series:
+    """Vectorized keyword scan (case-insensitive) over a text series."""
+    pattern = '|'.join(re.escape(k) for k in keywords)
+    return text_series.str.contains(pattern, case=False, na=False, regex=True)
 
 class FeatureEngineer:
     def __init__(self, csv_dir: str = "data/raw_csvs"):
@@ -43,6 +110,19 @@ class FeatureEngineer:
             df['sec1_time'] = pd.to_numeric(df['sec1_time'], errors='coerce')
         else:
             df['sec1_time'] = np.nan
+
+        # NEW: Official ratings, gear, jockey allowance & incident report.
+        # Old CSVs may lack these columns entirely -> fall back to defaults.
+        for col in ['horse_rating', 'jockey_allowance', 'class_max_rating']:
+            if col not in df.columns:
+                df[col] = 0
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        if 'gear' not in df.columns:
+            df['gear'] = ''
+        df['gear'] = df['gear'].fillna('').astype(str)
+        if 'incident_report' not in df.columns:
+            df['incident_report'] = ''
+        df['incident_report'] = df['incident_report'].fillna('').astype(str)
         
         # 3. Create a unique race_id
         # Creates a unique ID like "2020-01-01_Race1"
@@ -84,6 +164,67 @@ class FeatureEngineer:
         
         return df
 
+    def calculate_claim_and_implied_rating(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Deterministic imputation of apprentice jockey claims and implied ratings.
+
+        jockey_allowance (stored POSITIVE, e.g. 7 = 7 lb claim) is reconstructed
+        in precedence order:
+          1. Inline claim in the jockey cell, e.g. 'M F Poon(-5)'.
+          2. HKJC claim ladder from the jockey's wins-to-date (prior wins offset
+             + wins counted inside our own results, strictly .shift(1)).
+          3. Any previously scraped (absolute) value.
+
+        declared_weight  = weight_carried + jockey_allowance  (official handicap)
+        effective_carried_weight = weight_carried (HKJC results are already net
+        of apprentice claims).
+
+        implied_rating maps carried weight inside [115, 135] lb linearly onto
+        the race's class band [class_min, class_max] and is used ONLY where the
+        scraped horse_rating is missing. It uses current-race static conditions
+        only -> zero look-ahead leakage.
+        """
+        logger.info("Imputing jockey allowances (claim ladder) & implied ratings...")
+        df = df.sort_values(['race_date', 'race_id']).reset_index(drop=True)
+
+        # 1. Inline claim regex: 'P N Wong(-7)' / 'C L Chau (-2)'
+        inline = df['jockey'].astype(str).str.extract(r'\([^\d]*?(\d{1,2})[^\d]*?\)')[0]
+        inline = pd.to_numeric(inline, errors='coerce').fillna(0)
+
+        # 2. Ladder claim from career wins-to-date (prior offset + data wins)
+        wins_to_date = (
+            df.groupby('jockey')['is_win']
+              .transform(lambda x: x.shift(1).cumsum().fillna(0))
+        )
+        offset = df['jockey'].map(APPRENTICE_PRIOR_WINS)
+        is_apprentice = offset.notna()
+        total_wins = wins_to_date + offset.fillna(0)
+        ladder_claim = total_wins.apply(claim_from_wins).where(is_apprentice, 0)
+
+        # 3. Scraped allowance (may use negative convention, e.g. -5)
+        scraped = pd.to_numeric(df['jockey_allowance'], errors='coerce').abs().fillna(0)
+
+        claim = inline.where(inline > 0, ladder_claim)
+        claim = claim.where(claim > 0, scraped)
+        df['jockey_allowance'] = claim.astype(float)
+
+        # 4. Weight bookkeeping (allowance stored positive -> add to get declared)
+        df['declared_weight'] = pd.to_numeric(df['weight_carried'], errors='coerce') + df['jockey_allowance']
+        df['effective_carried_weight'] = pd.to_numeric(df['weight_carried'], errors='coerce')
+
+        # 5. Implied handicap rating for rows missing an official rating
+        cls = df['race_class'].astype(str).str.lower()
+        cmax = pd.to_numeric(df['class_max_rating'], errors='coerce')
+        fallback_max = cls.map(CLASS_FALLBACK_MAX)
+        cmax = cmax.where(cmax > 0, fallback_max)
+        band_width = cls.map(CLASS_BAND_WIDTHS).fillna(20)
+        cmin = cmax - band_width
+
+        w = pd.to_numeric(df['weight_carried'], errors='coerce')
+        frac = ((w - 115.0) / (135.0 - 115.0)).clip(0, 1)
+        df['implied_rating'] = (cmin + frac * (cmax - cmin)).round(1)
+
+        return df
+
     def calculate_speed_figures(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculates Track Variant and Normalized Speed Figures without look-ahead bias."""
         logger.info("Calculating Speed Figures...")
@@ -112,6 +253,10 @@ class FeatureEngineer:
 
         epsilon = 1e-6
         df['speed_figure'] = (df['track_variant_mean'] - df['finishing_time']) / (df['track_variant_std'] + epsilon)
+
+        # Winsorize to prevent explosion when the expanding variance is near zero
+        # (early samples with 1-2 past runs could produce figures up to ~600k)
+        df['speed_figure'] = np.clip(df['speed_figure'], -4.5, 4.5)
 
         # Shift the speed figure so it represents the horse's PREVIOUS race speed figure
         df['past_speed_figure'] = df.groupby('horse_id')['speed_figure'].shift(1)
@@ -274,7 +419,8 @@ class FeatureEngineer:
         epsilon = 0.1 # Minimum standard deviation fallback to avoid explosions
         # Z-score for early speed. Negative means faster than average
         # Apply a max/min clip to prevent insane outliers where the track has 1 past run
-        df['standardized_early_speed'] = ((df['sec1_time'] - df['sec1_mean']) / df['sec1_std'].clip(lower=epsilon)).clip(-5, 5)
+        # Winsorized at +/-4.5 standard deviations (matching speed_figure winsorization)
+        df['standardized_early_speed'] = ((df['sec1_time'] - df['sec1_mean']) / df['sec1_std'].clip(lower=epsilon)).clip(-4.5, 4.5)
 
         # For horses where sec1_time was completely missing, fill with 0 (average)
         df['standardized_early_speed'] = df['standardized_early_speed'].fillna(0)
@@ -360,6 +506,231 @@ class FeatureEngineer:
         
 # NOTE: Run style should be calculated in apply_lag_features using historical data to avoid leakage.
         
+        return df
+
+    def calculate_rating_and_gear_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculates rating benchmark, gear change and effective carried weight features."""
+        logger.info("Calculating Rating / Gear / Effective Weight Features...")
+
+        group_col = 'horse_code' if 'horse_code' in df.columns else 'horse_id'
+        df = df.sort_values(by=[group_col, 'race_date', 'race_id'])
+
+        # Official rating where available; implied handicap rating otherwise
+        # (deterministic fallback built from carried weight + class band).
+        official = pd.to_numeric(df['horse_rating'], errors='coerce').fillna(0)
+        implied = pd.to_numeric(df.get('implied_rating'), errors='coerce').fillna(0)
+        rating_used = official.where(official > 0, implied)
+
+        # 1. rating_diff_vs_class_max: horse rating minus top benchmark of the race class.
+        #    Prefer the scraped class band; fall back to the max rating among runners.
+        if 'class_max_rating' in df.columns:
+            class_max = pd.to_numeric(df['class_max_rating'], errors='coerce')
+            class_max = class_max.where(class_max > 0)
+        else:
+            class_max = pd.Series(np.nan, index=df.index)
+        race_benchmark = class_max.fillna(rating_used.groupby(df['race_id']).transform('max'))
+        df['rating_diff_vs_class_max'] = rating_used - race_benchmark
+
+        # 2. rating_change: rating delta vs the horse's previous start (lag, not scraped form card)
+        df['rating_change'] = rating_used.groupby(df[group_col]).diff().fillna(0)
+
+        # 3. gear_change_flag: 1 if current gear differs from previous race's gear
+        prev_gear = df.groupby(group_col)['gear'].shift(1)
+        df['gear_change_flag'] = ((df['gear'] != prev_gear) & prev_gear.notna()).astype(int)
+
+        # 4. first_time_blinkers: wears 'B' now AND never wore 'B' in any prior start
+        wears_blinkers = df['gear'].str.contains('B', case=False, na=False).astype(int)
+        prior_blinker_runs = (
+            wears_blinkers.groupby(df[group_col])
+            .transform(lambda x: x.shift(1).cumsum().fillna(0))
+        )
+        df['first_time_blinkers'] = ((wears_blinkers == 1) & (prior_blinker_runs == 0)).astype(int)
+
+        # 5. effective_carried_weight: HKJC results are already net of apprentice
+        #    claims, so the effective carried weight IS weight_carried. The separate
+        #    declared_weight (weight + claim) is computed in the imputation step.
+        df['effective_carried_weight'] = pd.to_numeric(df['weight_carried'], errors='coerce')
+
+        return df
+
+    def calculate_forgive_flags(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Builds rule-based 'forgive' flags from the previous race's stewards' incident text.
+
+        All flags are strictly shifted by one race (.shift(1)) so is_forgive_run is
+        derived exclusively from past starts (no look-ahead).
+        """
+        logger.info("Calculating Forgive Flags from Racing Incident Reports...")
+
+        group_col = 'horse_code' if 'horse_code' in df.columns else 'horse_id'
+        df = df.sort_values(by=[group_col, 'race_date', 'race_id'])
+
+        text = df['incident_report'].fillna('').astype(str)
+
+        blocked = _text_contains_flags(text, BLOCKED_KEYWORDS)
+        wide = _text_contains_flags(text, WIDE_NO_COVER_KEYWORDS)
+        bad_start = _text_contains_flags(text, BAD_START_KEYWORDS)
+
+        # Shift so the flag describes what happened in the horse's LAST race
+        df['last_race_blocked'] = blocked.groupby(df[group_col]).transform(lambda x: x.shift(1).fillna(False)).astype(int)
+        df['last_race_wide_no_cover'] = wide.groupby(df[group_col]).transform(lambda x: x.shift(1).fillna(False)).astype(int)
+        df['last_race_bad_start'] = bad_start.groupby(df[group_col]).transform(lambda x: x.shift(1).fillna(False)).astype(int)
+
+        df['is_forgive_run'] = (
+            df[['last_race_blocked', 'last_race_wide_no_cover', 'last_race_bad_start']].sum(axis=1) > 0
+        ).astype(int)
+
+        return df
+
+    # --- Trainer Intent / Trackwork Feature Engine ---
+    TRACKWORK_FILE = "data/trackwork.csv"
+    TRIALS_FILE = "data/trials.csv"
+    TRAINER_SURVIVAL_TARGET = 16  # HKJC license benchmark wins per season
+
+    def calculate_trainer_intent_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Trainer survival & seasonality motivation features (all strictly lag-shifted)."""
+        logger.info("Calculating Trainer Intent & Seasonality Features...")
+        df = df.sort_values(by=['race_date', 'race_id'])
+
+        # HKJC season runs Sep 1 - Jul 31 (season id = calendar year of the season start)
+        df['season'] = np.where(df['race_date'].dt.month >= 9,
+                                df['race_date'].dt.year,
+                                df['race_date'].dt.year - 1)
+
+        # Cumulative PRIOR wins per trainer per season (strict .shift(1) -> no look-ahead)
+        df['trainer_season_wins_to_date'] = (
+            df.groupby(['trainer', 'season'])['is_win']
+              .transform(lambda x: x.shift(1).cumsum())
+              .fillna(0)
+        )
+
+        # Remaining wins to hit the official survival benchmark
+        df['trainer_quota_gap'] = np.maximum(
+            0, self.TRAINER_SURVIVAL_TARGET - df['trainer_season_wins_to_date'])
+
+        # Urgency = max(0, Target - Wins) / (remaining weeks in season + 1)
+        end_year = np.where(df['race_date'].dt.month >= 9,
+                            df['race_date'].dt.year + 1,
+                            df['race_date'].dt.year)
+        season_end = pd.to_datetime({'year': end_year, 'month': 7, 'day': 31})
+        weeks_left = ((season_end - df['race_date']).dt.days / 7.0).clip(lower=0)
+        df['trainer_urgency_index'] = df['trainer_quota_gap'] / (weeks_left + 1)
+
+        # Title contender: trainer among the day's top-3 by season wins, in May-Jul only
+        day_rank = df.groupby('race_date')['trainer_season_wins_to_date'].rank(
+            method='dense', ascending=False)
+        df['trainer_is_title_contender'] = (
+            (day_rank <= 3) & (df['race_date'].dt.month.isin([5, 6, 7]))
+        ).astype(int)
+
+        df = df.drop(columns=['season'])
+        return df
+
+    def _load_events(self, path: str, cols: list):
+        """Loads an optional event CSV (trackwork / trials); returns None if absent."""
+        if not os.path.exists(path):
+            return None
+        try:
+            ev = pd.read_csv(path)
+            for c in cols:
+                if c not in ev.columns:
+                    ev[c] = None
+            return ev[cols].copy()
+        except Exception as e:
+            logger.warning(f"Could not load {path}: {e}")
+            return None
+
+    def calculate_trackwork_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Jockey commitment & fitness features from trackwork / trial CSVs.
+
+        All windows are computed strictly on events BEFORE the race day (no
+        look-ahead). When the CSVs are missing (historical data), every feature
+        defaults to a neutral 0.
+        """
+        logger.info("Calculating Trackwork & Trial Intent Features...")
+        group_col = 'horse_code' if 'horse_code' in df.columns else 'horse_id'
+        zero_cols = ['jockey_rode_trackwork_count_14d', 'is_jockey_exclusive_worker',
+                     'fast_gallop_count_14d', 'swim_count_14d', 'trackwork_time_zscore',
+                     'trial_won_before_race']
+        for c in zero_cols:
+            df[c] = 0
+
+        tw = self._load_events(self.TRACKWORK_FILE,
+                               ['horse_code', 'activity_date', 'work_type', 'rider', 'time_400'])
+        trials = self._load_events(self.TRIALS_FILE,
+                                   ['horse_code', 'trial_date', 'finish_pos', 'margin_behind_leader'])
+        if tw is None and trials is None:
+            logger.info("No trackwork/trials CSVs found - intent features default to 0.")
+            return df
+
+        work = df.sort_values(['race_date', 'race_id'])
+        w_codes = work[group_col].astype(str)
+        w_jocks = work['jockey'].astype(str).str.upper()
+        w_dates = work['race_date']
+
+        if tw is not None and len(tw):
+            tw = tw.copy()
+            tw['activity_date'] = pd.to_datetime(tw['activity_date'], errors='coerce')
+            tw['time_400'] = pd.to_numeric(tw['time_400'], errors='coerce')
+            tw['is_fast'] = tw['work_type'].fillna('').astype(str).str.contains(
+                'gallop|fast', case=False, na=False).astype(int)
+            tw['is_swim'] = tw['work_type'].fillna('').astype(str).str.contains(
+                'swim', case=False, na=False).astype(int)
+            global_mean = tw['time_400'].mean()
+            global_std = tw['time_400'].std()
+            if pd.isna(global_std) or global_std == 0:
+                global_std = 1.0
+
+            for code, ev in tw.groupby('horse_code'):
+                ev = ev.sort_values('activity_date')
+                ev_dates = ev['activity_date'].values
+                rows = work.index[w_codes == str(code)]
+                for ri in rows:
+                    rd = w_dates.iloc[ri]
+                    lo14 = pd.Timestamp(rd) - pd.Timedelta(days=14)
+                    sel = (ev_dates >= lo14) & (ev_dates < pd.Timestamp(rd))
+                    if not sel.any():
+                        continue
+                    sub = ev[sel]
+                    work.at[ri, 'fast_gallop_count_14d'] = sub['is_fast'].sum()
+                    work.at[ri, 'swim_count_14d'] = sub['is_swim'].sum()
+                    work.at[ri, 'jockey_rode_trackwork_count_14d'] = (
+                        sub['rider'].fillna('').astype(str).str.upper() == w_jocks.iloc[ri]
+                    ).sum()
+                    t400 = sub['time_400'].dropna()
+                    if len(t400):
+                        # Faster (lower) time -> higher positive z-score
+                        work.at[ri, 'trackwork_time_zscore'] = (
+                            (global_mean - t400.min()) / global_std).clip(-4.5, 4.5)
+                    lo21 = pd.Timestamp(rd) - pd.Timedelta(days=21)
+                    fast21 = ev[(ev_dates >= lo21) & (ev_dates < pd.Timestamp(rd))
+                                & (ev['is_fast'].values == 1)]
+                    if len(fast21):
+                        frac = (fast21['rider'].fillna('').astype(str).str.upper()
+                                == w_jocks.iloc[ri]).mean()
+                        work.at[ri, 'is_jockey_exclusive_worker'] = int(frac >= 0.7)
+
+        if trials is not None and len(trials):
+            trials = trials.copy()
+            trials['trial_date'] = pd.to_datetime(trials['trial_date'], errors='coerce')
+            trials['finish_pos'] = pd.to_numeric(trials['finish_pos'], errors='coerce')
+            trials['margin_behind_leader'] = pd.to_numeric(trials['margin_behind_leader'], errors='coerce')
+            for code, ev in trials.groupby('horse_code'):
+                ev = ev.sort_values('trial_date')
+                ev_dates = ev['trial_date'].values
+                rows = work.index[w_codes == str(code)]
+                for ri in rows:
+                    rd = w_dates.iloc[ri]
+                    lo28 = pd.Timestamp(rd) - pd.Timedelta(days=28)
+                    sel = (ev_dates >= lo28) & (ev_dates < pd.Timestamp(rd))
+                    if not sel.any():
+                        continue
+                    sub = ev[sel]
+                    work.at[ri, 'trial_won_before_race'] = int(
+                        ((sub['finish_pos'] == 1)
+                         | (sub['margin_behind_leader'].fillna(np.inf) <= 1.0)).any())
+
+        # Align back onto the original frame (by index)
+        df[zero_cols] = work[zero_cols]
         return df
 
     def apply_lag_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -513,6 +884,43 @@ class FeatureEngineer:
 
         return df
 
+    def calculate_race_context_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Intra-race comparative features (grouped by race_id).
+
+        All inputs are either lagged form features (last_speed_figure,
+        past_standardized_early_speed, run_style) or current-race static
+        conditions (weight_carried) -> zero look-ahead leakage.
+        """
+        logger.info("Calculating race-context relative features...")
+
+        for col in ['last_speed_figure', 'weight_carried', 'past_standardized_early_speed']:
+            if col not in df.columns:
+                df[col] = 0.0
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        g = df.groupby('race_id')
+
+        # Speed relativity (higher speed_figure = faster)
+        df['rel_speed_to_race_mean'] = df['last_speed_figure'] - g['last_speed_figure'].transform('mean')
+        df['rel_speed_to_race_max'] = df['last_speed_figure'] - g['last_speed_figure'].transform('max')
+        df['speed_rank_in_field'] = g['last_speed_figure'].rank(ascending=False, method='dense')
+
+        # Weight advantage (讓磅優勢)
+        df['weight_rel_to_top'] = df['weight_carried'] - g['weight_carried'].transform('max')
+        df['weight_rel_to_mean'] = df['weight_carried'] - g['weight_carried'].transform('mean')
+
+        # Pace density: share of declared front-runners in the field
+        leaders = (df['run_style'] == 'Leader').astype(int)
+        field_size = g['horse_id'].transform('count')
+        df['race_front_runner_density'] = leaders.groupby(df['race_id']).transform('sum') / field_size
+
+        # Early speed vs the fastest early horse in the field
+        df['early_speed_vs_field_fastest'] = (
+            df['past_standardized_early_speed'] - g['past_standardized_early_speed'].transform('max')
+        )
+
+        return df
+
     def save_features(self, df: pd.DataFrame):
         """Saves the engineered features to a new CSV file."""
         logger.info("Saving features to CSV file 'data/model_features.csv'...")
@@ -559,6 +967,31 @@ class FeatureEngineer:
             col = f'sec{i}_time'
             if col in df.columns:
                 feature_cols.append(col)
+
+        # NEW: Ratings, gear, allowance, incident text & derived features
+        for col in ['horse_rating', 'rating_change', 'jockey_allowance', 'class_max_rating',
+                    'gear', 'incident_report', 'rating_diff_vs_class_max', 'gear_change_flag',
+                    'first_time_blinkers', 'effective_carried_weight',
+                    'last_race_blocked', 'last_race_wide_no_cover', 'last_race_bad_start',
+                    'is_forgive_run']:
+            if col in df.columns and col not in feature_cols:
+                feature_cols.append(col)
+
+        # NEW: Trainer intent & trackwork features
+        for col in ['trainer_season_wins_to_date', 'trainer_quota_gap', 'trainer_urgency_index',
+                    'trainer_is_title_contender', 'jockey_rode_trackwork_count_14d',
+                    'is_jockey_exclusive_worker', 'fast_gallop_count_14d', 'swim_count_14d',
+                    'trackwork_time_zscore', 'trial_won_before_race']:
+            if col in df.columns and col not in feature_cols:
+                feature_cols.append(col)
+
+        # NEW: Claim imputation, implied rating & race-context relative features
+        for col in ['declared_weight', 'implied_rating',
+                    'rel_speed_to_race_mean', 'rel_speed_to_race_max', 'speed_rank_in_field',
+                    'weight_rel_to_top', 'weight_rel_to_mean',
+                    'race_front_runner_density', 'early_speed_vs_field_fastest']:
+            if col in df.columns and col not in feature_cols:
+                feature_cols.append(col)
             
         features_df = df[feature_cols].copy()
         
@@ -571,12 +1004,18 @@ class FeatureEngineer:
     def run_pipeline(self):
         """Executes the full feature engineering pipeline."""
         df = self.load_data()
+        df = self.calculate_claim_and_implied_rating(df)
         df = self.calculate_speed_figures(df)
         df = self.calculate_rolling_win_rates(df)
         df = self.calculate_weight_differentials(df)
         df = self.calculate_running_position_features(df)
         df = self.calculate_advanced_features(df)
+        df = self.calculate_rating_and_gear_features(df)
+        df = self.calculate_forgive_flags(df)
+        df = self.calculate_trainer_intent_features(df)
+        df = self.calculate_trackwork_features(df)
         df = self.apply_lag_features(df)
+        df = self.calculate_race_context_features(df)
         self.save_features(df)
 
 if __name__ == "__main__":

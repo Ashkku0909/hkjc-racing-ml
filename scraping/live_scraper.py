@@ -1,39 +1,366 @@
 import asyncio
+import csv
+import os
+import re
+import threading
+import time
+import json
+import gzip
+import urllib.request
+from typing import Optional, Tuple
 import pandas as pd
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from datetime import datetime
-import re
 from cachetools import TTLCache
 from async_lru import alru_cache
+
+from scraping.scraper import GRAPHQL_BASE_URL, RACECARD_PROFILE_QUERY
+
+# Race header metadata parsed from the WP page (used for the terminal countdown).
+# key = (date_str, venue, race_num) -> {'title', 'post_hhmm', 'fetched_at'}
+RACE_META: dict = {}
 
 # Cache for formguide which doesn't change often
 _formguide_cache = TTLCache(maxsize=100, ttl=3600)  # 1 hour cache
 
+# =====================================================================
+# In-memory live odds snapshot cache (smart money flow engine)
+# =====================================================================
+# Tracks odds snapshots per (race_date, venue, race_no) over time so the
+# smart-money scorer can compare current odds against a baseline scraped
+# >= BASELINE_LEAD_SECONDS before the jump.
+_odds_snapshots = {}          # key -> [{'timestamp': float, 'df': DataFrame}]
+_snapshot_lock = threading.Lock()
+SNAPSHOT_TTL_SECONDS = 4 * 3600   # prune snapshots older than 4 hours
+BASELINE_LEAD_SECONDS = 900       # baseline must be >= 15m old to be "mature"
+
+
+def _snapshot_key(date_str, venue, race_num):
+    return (str(date_str), str(venue), int(race_num))
+
+
+def record_odds_snapshot(date_str, venue, race_num, df):
+    """Stores an immutable copy of a polled odds frame with its wall-clock
+    timestamp. Call this every time scrape_live_odds succeeds."""
+    if df is None or len(df) == 0:
+        return
+    key = _snapshot_key(date_str, venue, race_num)
+    now = time.time()
+    snap = df.copy()
+    with _snapshot_lock:
+        snaps = _odds_snapshots.setdefault(key, [])
+        snaps[:] = [s for s in snaps if now - s['timestamp'] < SNAPSHOT_TTL_SECONDS]
+        snaps.append({'timestamp': now, 'df': snap})
+
+
+def get_odds_baseline(date_str, venue, race_num, min_age_seconds=BASELINE_LEAD_SECONDS):
+    """Returns (baseline_df, age_seconds, mature) for the race.
+
+    The baseline is the OLDEST retained snapshot. `mature` is True only when
+    that snapshot is at least min_age_seconds old (default: 15 minutes before
+    jump). Returns (None, 0.0, False) when no snapshots exist yet.
+    """
+    key = _snapshot_key(date_str, venue, race_num)
+    now = time.time()
+    with _snapshot_lock:
+        snaps = [s for s in _odds_snapshots.get(key, [])]
+        snaps = [s for s in snaps if now - s['timestamp'] < SNAPSHOT_TTL_SECONDS]
+        if not snaps:
+            return None, 0.0, False
+        oldest = min(snaps, key=lambda s: s['timestamp'])
+        return oldest['df'].copy(), now - oldest['timestamp'], (now - oldest['timestamp']) >= min_age_seconds
+
+
+# =====================================================================
+# Odds snapshot PERSISTENCE (real-data store for the execution audit)
+# Writes every poll to data/odds_snapshots/YYYYMMDD_VENUE.csv so the
+# T-15m baseline / T-3m decision / T-0 close can be replayed later against
+# the official final dividends (zero-lookahead dual-track backtest).
+# =====================================================================
+SNAPSHOT_DIR = os.path.join("data", "odds_snapshots")
+SNAPSHOT_COLUMNS = ['timestamp', 'epoch', 'race_id', 'venue', 'horse_number',
+                    'horse_name', 'win_odds', 'place_odds', 'time_to_post']
+_snapshot_csv_lock = threading.Lock()
+
+
+def _normalize_date(date_str) -> str:
+    """Normalizes '2026-09-06' / '2026/09/06' / '20260906' to YYYY-MM-DD."""
+    m = re.match(r'^(\d{4})[-/]?(\d{1,2})[-/]?(\d{1,2})$', str(date_str).strip())
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    return str(date_str)
+
+
+def _snapshot_path(date_str: str, venue: str) -> str:
+    day = _normalize_date(date_str).replace('-', '')
+    return os.path.join(SNAPSHOT_DIR, f"{day}_{str(venue).upper()}.csv")
+
+
+def _append_snapshot_csv_rows(rows: list) -> None:
+    """Synchronous per-day CSV append (called inside asyncio.to_thread)."""
+    if not rows:
+        return
+    path = _snapshot_path(rows[0]['race_id'].split('_Race')[0], rows[0]['venue'])
+    is_new = not os.path.exists(path)
+    with _snapshot_csv_lock:
+        with open(path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=SNAPSHOT_COLUMNS, extrasaction='ignore')
+            if is_new:
+                writer.writeheader()
+            for r in rows:
+                writer.writerow({c: r.get(c) for c in SNAPSHOT_COLUMNS})
+
+
+async def persist_odds_snapshot(date_str: str, venue: str, race_num: int,
+                                df: Optional[pd.DataFrame],
+                                time_to_post: Optional[float] = None) -> None:
+    """Non-blocking persistence of one poll.
+
+    Updates the in-memory cache AND appends the poll to the per-meeting CSV
+    (data/odds_snapshots/YYYYMMDD_VENUE.csv). time_to_post is seconds before
+    post (positive); it labels the snapshot for the T-15m / T-3m / T-0 audit.
+    """
+    if df is None or len(df) == 0:
+        return
+    now_epoch = time.time()
+    with _snapshot_lock:
+        snaps = _odds_snapshots.setdefault(_snapshot_key(date_str, venue, race_num), [])
+        snaps[:] = [s for s in snaps if now_epoch - s['timestamp'] < SNAPSHOT_TTL_SECONDS]
+        snaps.append({'timestamp': now_epoch, 'df': df.copy()})
+
+    race_id = f"{_normalize_date(date_str)}_Race{int(race_num)}"
+    ts_iso = datetime.fromtimestamp(now_epoch).isoformat(timespec='seconds')
+    rows = []
+    for _, r in df.iterrows():
+        rows.append({
+            'timestamp': ts_iso,
+            'epoch': round(now_epoch, 3),
+            'race_id': race_id,
+            'venue': str(venue).upper(),
+            'horse_number': r.get('horse_number'),
+            'horse_name': r.get('horse_name'),
+            'win_odds': r.get('win_odds'),
+            'place_odds': r.get('place_odds'),
+            'time_to_post': round(float(time_to_post), 1) if time_to_post is not None else None,
+        })
+    try:
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        await asyncio.to_thread(_append_snapshot_csv_rows, rows)
+    except Exception as e:
+        print(f"Snapshot persistence failed ({race_id}): {e}")
+
+
+def load_odds_snapshots(date_str: Optional[str] = None,
+                        venue: Optional[str] = None) -> pd.DataFrame:
+    """Loads persisted snapshot CSVs into one DataFrame (REAL data only).
+
+    Optional filters: date_str (YYYY-MM-DD / YYYYMMDD) and venue ('ST'/'HV').
+    Returns an empty typed frame when the store is empty.
+    """
+    if not os.path.isdir(SNAPSHOT_DIR):
+        return pd.DataFrame(columns=SNAPSHOT_COLUMNS)
+    frames = []
+    want_day = _normalize_date(date_str).replace('-', '') if date_str else None
+    for fn in sorted(os.listdir(SNAPSHOT_DIR)):
+        if not fn.endswith('.csv'):
+            continue
+        stem = fn[:-4]
+        parts = stem.split('_')
+        if len(parts) < 2:
+            continue
+        fday, fvenue = parts[0], parts[1]
+        if want_day is not None and fday != want_day:
+            continue
+        if venue is not None and fvenue.upper() != str(venue).upper():
+            continue
+        try:
+            frames.append(pd.read_csv(os.path.join(SNAPSHOT_DIR, fn)))
+        except Exception as e:
+            print(f"Skipping snapshot file {fn}: {e}")
+    if not frames:
+        return pd.DataFrame(columns=SNAPSHOT_COLUMNS)
+    df = pd.concat(frames, ignore_index=True)
+    df['epoch'] = pd.to_numeric(df['epoch'], errors='coerce')
+    return df
+
+
+def get_labelled_snapshot(date_str: str, venue: str, race_num: int,
+                          target_seconds: float,
+                          window: Tuple[float, float] = (90.0, 330.0)) -> Optional[pd.DataFrame]:
+    """Returns the persisted poll whose time_to_post is nearest `target_seconds`
+    within `window` (e.g. the T-3m decision poll), as a horse-level frame.
+    None when no matching labelled poll exists yet (real data only)."""
+    snaps = load_odds_snapshots(date_str, venue)
+    if len(snaps) == 0:
+        return None
+    race_id = f"{_normalize_date(date_str)}_Race{int(race_num)}"
+    sub = snaps[(snaps['race_id'] == race_id) & snaps['time_to_post'].notna()].copy()
+    if len(sub) == 0:
+        return None
+    t = pd.to_numeric(sub['time_to_post'], errors='coerce')
+    in_win = t.between(window[0], window[1])
+    if not in_win.any():
+        return None
+    best_idx = sub.index[in_win][(t[in_win] - target_seconds).abs().argmin()]
+    epoch = sub.loc[best_idx, 'epoch']
+    frame = snaps[(snaps['race_id'] == race_id) & (snaps['epoch'] == epoch)].copy()
+    frame['win_odds'] = pd.to_numeric(frame['win_odds'], errors='coerce')
+    frame['horse_number'] = pd.to_numeric(frame['horse_number'], errors='coerce')
+    return frame.drop_duplicates(subset='horse_number')
+
+
+def fetch_meeting_schedule(date_str, venue_code):
+    """Synchronous GraphQL fetch of the meeting's race schedule.
+
+    Uses the exact bundle-extracted RACECARD_PROFILE_QUERY (the server
+    allow-lists operation text, so trimmed queries silently return nothing).
+    Returns a list of dicts: {race_no, post_time (tz-aware datetime), status,
+    race_name}, ordered by race number. Empty list when there is no meeting
+    for the requested date/venue (e.g. HKJC off-season).
+    """
+    try:
+        req = urllib.request.Request(
+            GRAPHQL_BASE_URL,
+            data=json.dumps({
+                'query': RACECARD_PROFILE_QUERY,
+                'variables': {'date': str(date_str), 'venueCode': str(venue_code)},
+            }).encode(),
+            headers={
+                'content-type': 'application/json',
+                'accept-encoding': 'gzip, deflate',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            })
+        resp = urllib.request.urlopen(req, timeout=30)
+        raw = resp.read()
+        if resp.headers.get('Content-Encoding') == 'gzip':
+            raw = gzip.decompress(raw)
+        body = json.loads(raw.decode())
+        profile = (body.get('data') or {}).get('raceMeetingProfile') or []
+        if not profile:
+            return []
+
+        schedule = []
+        for race in profile[0].get('races') or []:
+            post_time_raw = race.get('postTime')
+            if not post_time_raw:
+                continue
+            try:
+                post_time = datetime.fromisoformat(str(post_time_raw))
+            except (ValueError, TypeError):
+                continue
+            schedule.append({
+                'race_no': int(race.get('no') or 0),
+                'post_time': post_time,
+                'status': race.get('status') or '',
+                'race_name': race.get('raceName_en') or '',
+            })
+        schedule.sort(key=lambda r: r['race_no'])
+        return schedule
+    except Exception as e:
+        print(f"Meeting schedule fetch failed for {date_str} {venue_code}: {e}")
+        return []
+
 class BrowserManager:
-    """Manages a single Playwright browser instance to avoid spinning up new ones repeatedly."""
+    """Manages a single Playwright browser instance to avoid spinning up new ones repeatedly.
+
+    Includes recycling (every N live-odds polls or 2h) and a heartbeat so the
+    Discord daemon watchdog can detect and respawn a frozen browser.
+    """
+    MAX_SCRAPES_BEFORE_RECYCLE = 3
+    MAX_AGE_SECONDS = 2 * 3600
+
     def __init__(self):
         self.playwright = None
         self.browser = None
+        self.opened_at: Optional[float] = None
+        self.scrape_count = 0
+        self._lock = threading.Lock()
 
     async def get_browser(self):
         if self.browser is None:
             self.playwright = await async_playwright().start()
             self.browser = await self.playwright.chromium.launch(headless=True)
+            with self._lock:
+                self.opened_at = time.time()
+                self.scrape_count = 0
             print("Started reusable Playwright browser.")
         return self.browser
 
     async def close(self):
+        with self._lock:
+            self.opened_at = None
+            self.scrape_count = 0
         if self.browser:
-            await self.browser.close()
+            try:
+                await self.browser.close()
+            except Exception as e:
+                print(f"Browser close error: {e}")
             self.browser = None
         if self.playwright:
-            await self.playwright.stop()
+            try:
+                await self.playwright.stop()
+            except Exception as e:
+                print(f"Playwright stop error: {e}")
             self.playwright = None
             print("Closed Playwright browser.")
 
+    def age_seconds(self) -> float:
+        with self._lock:
+            return (time.time() - self.opened_at) if self.opened_at else 0.0
+
+    def bump_scrape_count(self) -> None:
+        with self._lock:
+            self.scrape_count += 1
+
+    def recycle_due(self) -> bool:
+        with self._lock:
+            return bool(self.browser is not None and (
+                self.scrape_count >= self.MAX_SCRAPES_BEFORE_RECYCLE
+                or (self.opened_at and time.time() - self.opened_at >= self.MAX_AGE_SECONDS)))
+
+    async def recycle(self) -> None:
+        """Tears down the current browser; the next get_browser() respawns fresh."""
+        print("Recycling Playwright browser (memory hygiene).")
+        await self.close()
+
+
 # Global instance
 browser_manager = BrowserManager()
+
+# --- Live-daemon heartbeat / busy tracking (watchdog + safe recycle) ---
+_scrape_active = 0
+_first_start_since: Optional[float] = None
+_busy_lock = threading.Lock()
+
+
+def mark_scrape_started() -> None:
+    global _scrape_active, _first_start_since
+    with _busy_lock:
+        if _scrape_active == 0:
+            _first_start_since = time.time()
+        _scrape_active += 1
+
+
+def mark_scrape_finished() -> None:
+    global _scrape_active, _first_start_since
+    with _busy_lock:
+        _scrape_active = max(0, _scrape_active - 1)
+        if _scrape_active == 0:
+            _first_start_since = None
+
+
+def scrape_active() -> bool:
+    with _busy_lock:
+        return _scrape_active > 0
+
+
+def scrape_stalled(seconds: float = 180.0) -> bool:
+    """True when a scrape has been in flight (continuously) > `seconds`."""
+    with _busy_lock:
+        if _scrape_active == 0 or _first_start_since is None:
+            return False
+        return time.time() - _first_start_since > seconds
 
 @alru_cache(maxsize=32, ttl=3600)
 async def scrape_speedpro_formguide(race_num=1):
@@ -279,14 +606,17 @@ async def scrape_speedpro(race_num=1):
         await page.close()
 
 
-async def scrape_live_odds(date_str, venue="S1", race_num=1):
+async def scrape_live_odds(date_str, venue="S1", race_num=1, time_to_post: Optional[float] = None):
     """
     Scrapes live odds from the HKJC betting site.
     Example URL: https://bet.hkjc.com/en/racing/wp/2026-02-28/S1/1
+    time_to_post: seconds before post (labels the persisted snapshot for the
+    T-15m / T-3m / T-0 execution audit).
     """
     url = f"https://bet.hkjc.com/en/racing/wp/{date_str}/{venue}/{race_num}"
     print(f"Scraping live odds from: {url}")
-    
+    mark_scrape_started()
+
     browser = await browser_manager.get_browser()
     page = await browser.new_page()
         
@@ -304,6 +634,22 @@ async def scrape_live_odds(date_str, venue="S1", race_num=1):
         content = await page.content()
         soup = BeautifulSoup(content, 'html.parser')
         
+        # Verify the page is actually for the REQUESTED race: bet.hkjc.com serves
+        # the default (Race 1) card for out-of-range race numbers (e.g. /ST/11
+        # when the day only has 10 races), which previously poisoned card
+        # discovery and duplicated Race 1 in the board.
+        # Header shape: "Race 3\n06/09, SUN, 13:30, Group Three, ..."
+        hm = re.search(r'Race\s*(\d+)\s*(\d{2}/\d{2}),\s*(\w{3}),\s*(\d{2}:\d{2})', soup.text)
+        if hm and int(hm.group(1)) != int(race_num):
+            print(f"WRONG RACE served for {url}: header says Race {hm.group(1)} -> ignore")
+            return None
+        if hm and int(hm.group(1)) == int(race_num):
+            RACE_META[(date_str, venue, int(race_num))] = {
+                'title': soup.text[hm.start():hm.start() + 180].strip(),
+                'post_hhmm': hm.group(4),
+                'fetched_at': time.time(),
+            }
+            
         # Check if it's a valid race page
         if "No race" in soup.text or "not available" in soup.text:
             return None
@@ -402,6 +748,8 @@ async def scrape_live_odds(date_str, venue="S1", race_num=1):
             df.attrs['wpq_str'] = ""
             df.attrs['speedpro_images'] = []
 
+        # Persist this poll to memory + disk snapshot store (real-data audit trail)
+        await persist_odds_snapshot(date_str, venue, race_num, df, time_to_post=time_to_post)
         return df
 
     except Exception as e:
@@ -409,6 +757,14 @@ async def scrape_live_odds(date_str, venue="S1", race_num=1):
         return None
     finally:
         await page.close()
+        mark_scrape_finished()
+        # Memory hygiene: recycle ONLY when no other scrape is in flight
+        try:
+            browser_manager.bump_scrape_count()
+            if browser_manager.recycle_due() and not scrape_active():
+                await browser_manager.recycle()
+        except Exception as e:
+            print(f"Browser recycle error: {e}")
 
 if __name__ == "__main__":
     async def test():

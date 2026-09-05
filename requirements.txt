@@ -7,6 +7,6 @@ lightgbm
 scikit-learn
 discord.py
 python-dotenv
-google-genai
 streamlit
+streamlit-autorefresh
 matplotlib

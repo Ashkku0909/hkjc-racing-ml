@@ -5,6 +5,9 @@ CREATE TABLE races (
     race_date DATE NOT NULL,
     race_class VARCHAR(20),              -- e.g., 'Class 1', 'Group 1'
     distance INTEGER NOT NULL,           -- Stored in meters, e.g., 1200, 1650
+    place_dividends TEXT,                -- PLA pool dividend line(s)
+    quinella_dividend NUMERIC(6, 2),     -- QIN dividend
+    qpl_dividends TEXT,                  -- QPL pair dividends
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(track, race_date, distance)   -- Prevents duplicate race entries
 );
@@ -30,6 +33,17 @@ CREATE TABLE race_results (
     weight_carried NUMERIC(5, 2),        -- e.g., 133.0
     barrier_draw INTEGER,                -- e.g., 1 to 14
     win_odds NUMERIC(6, 2),              -- e.g., 4.50
+    sec1_time NUMERIC(6, 2),             -- Sectional times
+    sec2_time NUMERIC(6, 2),
+    sec3_time NUMERIC(6, 2),
+    sec4_time NUMERIC(6, 2),
+    sec5_time NUMERIC(6, 2),
+    sec6_time NUMERIC(6, 2),
+    horse_rating INTEGER,                -- Official HKJC rating (NULL for debutants)
+    rating_change INTEGER,               -- Rating delta vs previous start
+    gear VARCHAR(50),                    -- Equipment, e.g. 'B', 'TT', 'V', 'B/TT', '--'
+    jockey_allowance INTEGER,            -- Apprentice claim, e.g. -10, -5, -2, 0
+    incident_report TEXT,                -- Stewards' racing incident paragraph(s)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(race_id, horse_id)            -- A horse can only have one result per race
 );

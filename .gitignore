@@ -58,3 +58,14 @@ models/*.txt
 
 # Pickle / binary artifacts
 *.pkl
+
+# Generated data artifacts (runtime outputs - keep out of git)
+data/backtest_bets_log.csv
+data/backtest_equity_curve.csv
+data/dividends.csv
+data/exotics_bets_log.csv
+data/exotics_equity_curve.csv
+data/historical_dividends.csv
+data/kelly_sweep_results.csv
+data/odds_snapshots/
+data/walk_forward_preds.csv
