@@ -36,6 +36,7 @@ import web_live
 from web_live import (
     ensure_data_loaded, poll_race, card_size, score_race, flag_row,
     de_vig_market_probs, race_post_time, snap_store, SLOW_TTL,
+    effective_poll_ttl,
 )
 
 HKT = timezone(timedelta(hours=8))
@@ -132,6 +133,17 @@ st.markdown("""
 .qt-pace.meltdown { background:#3a1010; color:#FF5252; border:1px solid rgba(255,82,82,.5); }
 .qt-pace.lone { background:#0f2a1a; color:#00E676; border:1px solid rgba(0,230,118,.4); }
 .qt-pace.normal { background:#141c2e; color:#9E9E9E; }
+.qt-gate {
+  display:inline-block; padding:3px 12px; border-radius:4px; font-size:11px;
+  font-weight:700; margin:2px 6px 10px 0; background:#33260a; color:#FFB300;
+  border:1px solid rgba(255,179,0,.65); animation:qtgate 1s ease-in-out infinite;
+}
+.qt-turbo {
+  display:inline-block; padding:3px 12px; border-radius:4px; font-size:11px;
+  font-weight:700; margin:2px 6px 10px 0; background:#1a2433; color:#ffd166;
+  border:1px solid rgba(255,209,102,.5);
+}
+@keyframes qtgate { 0%,100% { opacity:1; } 50% { opacity:.4; } }
 </style>
 """, unsafe_allow_html=True)
 
@@ -225,13 +237,18 @@ def flow_badge(signal, smart):
 
 
 def win_prime(r) -> bool:
-    """Prime Win: EV_win >= 1.22 & win_odds in [4.5, 8.0] & S >= 50."""
-    odds = num(r.get('win_odds'))
-    ev = num(r.get('ev'))
-    smart = num(r.get('smart_money_score'), 50.0)
-    if odds is None or ev is None:
+    """Prime Win (dual-mode guardrails):
+      P_final >= 0.16 AND EV_win >= 1.15 AND O_W in [2.2, 14.0] AND S >= 50.
+    Longshots (O_W > 14.0) with EV >= 1.25 are NEVER surfaced as straight WIN.
+    """
+    odds = numf(r.get('win_odds'))
+    prob = numf(r.get('prob'))
+    ev = numf(r.get('ev'))
+    smart = numf(r.get('smart_money_score')) or 50.0
+    if odds is None or prob is None or ev is None:
         return False
-    return 4.5 <= odds <= 8.0 and (ev + 1.0) >= 1.22 and smart >= 50
+    return (prob >= 0.16 and (ev + 1.0) >= 1.15
+            and 2.2 <= odds <= 14.0 and smart >= 50.0)
 
 
 def place_prime(r) -> bool:
@@ -256,6 +273,14 @@ def verdict_of(r):
         return 'preopen', '⏳ PRE-OPEN'
     pw = win_prime(r)
     pp = place_prime(r)
+    evr = numf(r.get('ev'))
+    odds = numf(r.get('win_odds'))
+    # Longshot value trap -> exotics-only channel (PLACE / QP / TIERCE anchor)
+    if (not pw and pp and evr is not None and odds is not None
+            and (evr + 1.0) >= 1.25 and odds > 14.0):
+        return 'prime', '🎯 EXOTIC (P/QP/TIERCE)'
+    if bool(r.get('divergence_trap')) and pp:
+        return 'prime', '🎯 EXOTIC (P/QP/TIERCE)'
     if pw and pp:
         return 'prime', '🎯 DUAL VALUE'
     if pw:
@@ -347,6 +372,13 @@ def render_focus(scored, race_no):
 
     # --- Pace scenario matrix badge (lagged front-runner density) ---
     race_closed = bool(scored.iloc[0].get('race_closed')) if len(scored) else False
+    exec_state = str(scored.iloc[0].get('exec_state') or '') if len(scored) else ''
+    if exec_state == 'LOADING_DELAY':
+        st.markdown('<span class="qt-gate qt-term">🟡 GATE LOADING — TURBO STREAM '
+                    '(0.8s · W=0.85 pinned until freeze)</span>', unsafe_allow_html=True)
+    elif exec_state == 'TURBO_APPROACH':
+        st.markdown('<span class="qt-turbo qt-term">🚦 TURBO APPROACH — 0.8s STREAM '
+                    '· W=0.85</span>', unsafe_allow_html=True)
     if race_closed:
         st.markdown('<span class="qt-pace lone qt-term">🏁 RACE CLOSED — odds frozen at '
                     'official close; no live flow / EV signals.</span>', unsafe_allow_html=True)
@@ -602,8 +634,11 @@ race_no = int(mode[1:])
 st.session_state['qt_active_race'] = race_no
 
 post_dt = race_post_time(date_str, venue, race_no)
-ttl = 0.0 if force else float(poll_s)
-live = poll_race(date_str, venue, race_no, ttl=ttl)
+if not force and post_dt is not None:
+    poll_ttl = effective_poll_ttl(post_dt, float(poll_s))
+else:
+    poll_ttl = 0.0 if force else float(poll_s)
+live = poll_race(date_str, venue, race_no, ttl=poll_ttl)
 ok = live is not None and len(live) > 0
 st.session_state['qt_last_poll'] = time.time()
 st.session_state['qt_last_ok'] = ok

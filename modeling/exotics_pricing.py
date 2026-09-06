@@ -25,6 +25,45 @@ QPL_TAKEOUT = 0.25   # Quinella Place
 
 DEFAULT_PLACES = 3
 
+# Henery order-statistic discount: bounded [0.75, 0.88] and chosen DYNAMICALLY
+# from field size (small fields -> lower gamma, longshot place bias is sharper).
+HENERY_GAMMA_MIN = 0.75
+HENERY_GAMMA_MAX = 0.88
+
+
+def henery_gamma_for_field(field_size: int) -> float:
+    """Field-size-calibrated Henery gamma in [0.75, 0.88].
+
+    Larger fields need a higher discount because the rank-2/3/4 denominators
+    pool more longshot mass; small fields (4-6 runners) sit at the 0.75 floor.
+    """
+    n = max(4, int(field_size))
+    frac = min(max((n - 4) / (14 - 4), 0.0), 1.0)
+    return HENERY_GAMMA_MIN + frac * (HENERY_GAMMA_MAX - HENERY_GAMMA_MIN)
+
+
+def smart_place_absorption_mask(win_probs, place_odds) -> np.ndarray:
+    """Flag runners whose normalized implied PLACE probability significantly
+    exceeds their de-vigged WIN probability vs the field median ratio
+    (>= 1.5x median) - i.e. smart money hedging the place pool.
+    """
+    wp = np.asarray(win_probs, dtype=float)
+    po = np.asarray(place_odds, dtype=float)
+    n = len(wp)
+    mask = np.zeros(n, dtype=bool)
+    ok = np.isfinite(wp) & (wp > 0) & np.isfinite(po) & (po > 1.0)
+    if int(ok.sum()) < 2:
+        return mask
+    place_impl = np.where(ok, 1.0 / np.where(po > 0, po, np.nan), np.nan)
+    place_norm = place_impl / np.nansum(place_impl)
+    win_norm = np.where(ok, wp, np.nan)
+    win_norm = win_norm / np.nansum(win_norm)
+    ratio = np.where(ok & (win_norm > 0), place_norm / win_norm, np.nan)
+    med = float(np.nanmedian(ratio))
+    if np.isfinite(med) and med > 0:
+        mask = ok & (ratio >= 1.5 * med)
+    return mask
+
 
 def _normalize(probs: np.ndarray) -> np.ndarray:
     probs = np.asarray(probs, dtype=float)

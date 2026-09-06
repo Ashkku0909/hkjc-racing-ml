@@ -92,7 +92,9 @@ def get_odds_baseline(date_str, venue, race_num, min_age_seconds=BASELINE_LEAD_S
 # =====================================================================
 SNAPSHOT_DIR = os.path.join("data", "odds_snapshots")
 SNAPSHOT_COLUMNS = ['timestamp', 'epoch', 'race_id', 'venue', 'horse_number',
-                    'horse_name', 'win_odds', 'place_odds', 'time_to_post']
+                    'horse_name', 'win_odds', 'place_odds', 'time_to_post',
+                    'state', 't_tilde', 'win_velocity_90s',
+                    'is_final_jump_price', 'pool_volume']
 _snapshot_csv_lock = threading.Lock()
 
 
@@ -109,6 +111,40 @@ def _snapshot_path(date_str: str, venue: str) -> str:
     return os.path.join(SNAPSHOT_DIR, f"{day}_{str(venue).upper()}.csv")
 
 
+_migrated_files: set = set()
+
+
+def _migrate_snapshot_file(path: str) -> None:
+    """One-time schema upgrade for files written before the live-fusion era.
+
+    Old header: timestamp,epoch,race_id,venue,horse_number,horse_name,
+    win_odds,place_odds,time_to_post. Rewrites the whole per-day file with the
+    current SNAPSHOT_COLUMNS (new columns backfilled with None) so later
+    appends never misalign columns. Runs at most once per file per process.
+    """
+    if path in _migrated_files:
+        return
+    try:
+        with open(path, 'r', newline='', encoding='utf-8') as f:
+            header = f.readline().strip()
+    except Exception:
+        return
+    if not header or header.split(',') == SNAPSHOT_COLUMNS:
+        _migrated_files.add(path)
+        return
+    try:
+        old = pd.read_csv(path)
+        for c in SNAPSHOT_COLUMNS:
+            if c not in old.columns:
+                old[c] = None
+        old = old[SNAPSHOT_COLUMNS]
+        old.to_csv(path, index=False)
+        print(f"Migrated snapshot schema: {path}")
+    except Exception as e:
+        print(f"Snapshot migration failed ({path}): {e}")
+    _migrated_files.add(path)
+
+
 def _append_snapshot_csv_rows(rows: list) -> None:
     """Synchronous per-day CSV append (called inside asyncio.to_thread)."""
     if not rows:
@@ -116,6 +152,7 @@ def _append_snapshot_csv_rows(rows: list) -> None:
     path = _snapshot_path(rows[0]['race_id'].split('_Race')[0], rows[0]['venue'])
     is_new = not os.path.exists(path)
     with _snapshot_csv_lock:
+        _migrate_snapshot_file(path)
         with open(path, 'a', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=SNAPSHOT_COLUMNS, extrasaction='ignore')
             if is_new:
@@ -141,20 +178,82 @@ async def persist_odds_snapshot(date_str: str, venue: str, race_num: int,
         snaps[:] = [s for s in snaps if now_epoch - s['timestamp'] < SNAPSHOT_TTL_SECONDS]
         snaps.append({'timestamp': now_epoch, 'df': df.copy()})
 
+    # --- Execution-state labelling (lazy import avoids the circular edge ---
+    # web_live imports live_scraper at module load; by call time it is done).
+    state = 'PRE_POST'
+    t_tilde: Optional[float] = None
+    try:
+        from web_live import execution_state, t_tilde_seconds, race_post_time
+        post_dt = race_post_time(date_str, venue, race_num)
+        frames = []
+        for s in snaps:
+            d = s['df'].copy()
+            d['epoch'] = s['timestamp']
+            frames.append(d)
+        sub = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        state = execution_state(post_dt, sub)
+        t_tilde = t_tilde_seconds(post_dt)
+    except Exception as e:
+        print(f"state labelling failed: {e}")
+    is_final = bool(state == 'OFFICIAL_CLOSED')
+
+    # --- Relative odds velocity over the trailing 90s window (per horse) ---
+    def _fnum(v) -> Optional[float]:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    vel: dict = {}
+    hist = snaps[:-1]
+    if hist:
+        cutoff = now_epoch - 90.0
+        cand = [s for s in hist if s['timestamp'] <= cutoff]
+        base_snap = cand[-1] if cand else hist[0]
+        bmap = {}
+        for _, r in base_snap['df'].iterrows():
+            try:
+                hn = int(r.get('horse_number'))
+            except (TypeError, ValueError):
+                continue
+            w = _fnum(r.get('win_odds'))
+            if w:
+                bmap[hn] = w
+        for _, r in df.iterrows():
+            try:
+                hn = int(r.get('horse_number'))
+            except (TypeError, ValueError):
+                continue
+            w = _fnum(r.get('win_odds'))
+            bw = bmap.get(hn)
+            if w and bw and bw > 0:
+                vel[hn] = (w - bw) / bw
+
     race_id = f"{_normalize_date(date_str)}_Race{int(race_num)}"
-    ts_iso = datetime.fromtimestamp(now_epoch).isoformat(timespec='seconds')
+    ts_iso = datetime.fromtimestamp(now_epoch).isoformat(timespec='milliseconds')
     rows = []
     for _, r in df.iterrows():
+        hn = r.get('horse_number')
+        try:
+            hn_i = int(hn)
+        except (TypeError, ValueError):
+            hn_i = None
         rows.append({
             'timestamp': ts_iso,
             'epoch': round(now_epoch, 3),
             'race_id': race_id,
             'venue': str(venue).upper(),
-            'horse_number': r.get('horse_number'),
+            'horse_number': hn,
             'horse_name': r.get('horse_name'),
             'win_odds': r.get('win_odds'),
             'place_odds': r.get('place_odds'),
             'time_to_post': round(float(time_to_post), 1) if time_to_post is not None else None,
+            'state': state,
+            't_tilde': round(float(t_tilde), 1) if t_tilde is not None else None,
+            'win_velocity_90s': round(vel[hn_i], 6) if hn_i in vel else None,
+            'is_final_jump_price': is_final,
+            # the wp page does not expose pool volume text - left None (real data only)
+            'pool_volume': None,
         })
     try:
         os.makedirs(SNAPSHOT_DIR, exist_ok=True)

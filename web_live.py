@@ -20,10 +20,14 @@ import pandas as pd
 from scraping.live_scraper import scrape_live_odds, load_odds_snapshots, RACE_META
 from bot.analyzer_service import (
     get_data, merge_live_odds_with_predictions,
-    calculate_smart_money_metrics, apply_smart_money_bayesian_update,
+    calculate_smart_money_metrics,
     get_flow_signal, SMART_MONEY_CENTER,
 )
 from modeling.model_training import EDGE_DECAY_C, EDGE_DECAY_GAMMA
+from modeling.exotics_pricing import (
+    henery_gamma_for_field,
+    smart_place_absorption_mask,
+)
 
 KELLY_MIN_EV = 0.22
 KELLY_MIN_ODDS = 4.5
@@ -47,7 +51,33 @@ RECENT_FLOW_WINDOW_S = 600.0
 # A race is only CLOSED when its nominal post time has passed AND the quotes
 # have stopped moving for this long. Races run late (13:00 post often starts
 # 13:01+), so a still-ticking market must stay OPEN to capture final flow.
-CLOSED_FROZEN_SEC = 90.0
+CLOSED_FROZEN_SEC = 60.0
+# --- Dynamic post-time execution state machine ---------------------------
+# PRE_POST -> TURBO_APPROACH (T-90s) -> LOADING_DELAY (past nominal, ticking)
+#                                      -> OFFICIAL_CLOSED (frozen >= 60s)
+EXEC_STATES = ("PRE_POST", "TURBO_APPROACH", "LOADING_DELAY", "OFFICIAL_CLOSED")
+TURBO_LEAD_S = 90.0          # TURBO_APPROACH starts 90s before nominal post
+TURBO_TTL_S = 0.8            # throttled polling cadence inside the final window
+T_TILDE_MIN = 20.0           # effective time-to-jump floor (never decays to 0)
+T_TILDE_MAX = 45.0           # effective time-to-jump cap in the final band
+W_TILDE_EARLY = 0.25         # T~ > 15m   -> model dominates
+W_TILDE_MID = 0.50           # 5m < T~ <= 15m
+W_TILDE_LATE = 0.70          # 1m < T~ <= 5m
+W_TILDE_TURBO = 0.85         # T~ <= 1m / TURBO_APPROACH / LOADING_DELAY (pinned)
+FLOW_WINDOW_S = 90.0         # relative odds-velocity lookback window
+FLOW_STEAM_V = -0.15         # -15% win-price over the window = syndicate steam
+FLOW_DELTA_MIN = 0.10        # logit booster for a detected steam
+FLOW_DELTA_MAX = 0.35
+TRAP_MODEL_MIN = 0.30        # divergence-trap defense (adverse selection)
+TRAP_MARKET_MAX = 0.09
+TRAP_T_TILDE_S = 120.0       # trap armed only inside the final 2 minutes
+TRAP_LOGIT_PENALTY = -1.5    # heavy penalty on the fused logit
+# Dual-mode bet filter (win vs exotics routing)
+WIN_MIN_PROB = 0.16
+WIN_MIN_EV = 1.15
+WIN_MIN_ODDS = 2.2
+WIN_MAX_ODDS = 14.0
+EXOTIC_EV = 1.25
 SCRAPE_TIMEOUT = 45.0
 MAX_RACES = 12
 FOCUS_TTL = 5.0
@@ -406,6 +436,186 @@ def _market_frozen(sub: pd.DataFrame, frozen_sec: float = CLOSED_FROZEN_SEC) -> 
         return False
 
 
+# =====================================================================
+# Dynamic post-time execution state machine (HKJC off-time slippage)
+# =====================================================================
+HKT_TZ = timezone(timedelta(hours=8))
+
+
+def _now_hkt() -> datetime:
+    return datetime.now(HKT_TZ)
+
+
+def t_tilde_seconds(post_dt) -> Optional[float]:
+    """Effective time-to-jump in seconds.
+
+    Real seconds to nominal post, but inside the final 45s band the value is
+    STRETCHED into the rolling [T-45s, T-20s] interval so the fusion weight
+    never collapses to zero before the actual jump (HKJC posts run late).
+    """
+    if post_dt is None:
+        return None
+    s = (post_dt - _now_hkt()).total_seconds()
+    if s > T_TILDE_MAX:
+        return float(s)
+    return float(min(max(s, T_TILDE_MIN), T_TILDE_MAX))
+
+
+def execution_state(post_dt, sub: Optional[pd.DataFrame] = None,
+                    frozen_sec: float = CLOSED_FROZEN_SEC,
+                    now: Optional[datetime] = None) -> str:
+    """Adaptive 4-state execution lifecycle.
+
+    PRE_POST          t < nominal - 90s
+    TURBO_APPROACH    nominal - 90s <= t < nominal
+    LOADING_DELAY     t >= nominal while the pool is STILL ticking (gate
+                      loading / vet checks push the actual jump 1-3 min late)
+    OFFICIAL_CLOSED   past nominal AND zero odds change for >= frozen_sec,
+                      OR the scraper saw an official freeze banner.
+
+    `sub` is the persisted snapshot store for the race (epoch + win_odds);
+    when absent, past-nominal is conservatively LOADING_DELAY (never closed).
+    """
+    now = now or _now_hkt()
+    if post_dt is None:
+        return "PRE_POST"
+    s = (post_dt - now).total_seconds()
+    if s >= TURBO_LEAD_S:
+        return "PRE_POST"
+    if s >= 0:
+        return "TURBO_APPROACH"
+    if sub is not None and len(sub) and _market_frozen(sub, frozen_sec):
+        return "OFFICIAL_CLOSED"
+    return "LOADING_DELAY"
+
+
+def fusion_weight(post_dt, state: Optional[str] = None) -> float:
+    """Time-varying market weight w(T~) for the Bayesian blend.
+
+    Pinned at peak sensitivity (0.85) throughout TURBO_APPROACH and
+    LOADING_DELAY so last-second syndicate flows are always absorbed.
+    """
+    if state is None:
+        state = execution_state(post_dt)
+    if state in ("TURBO_APPROACH", "LOADING_DELAY"):
+        return W_TILDE_TURBO
+    tt = t_tilde_seconds(post_dt)
+    if tt is None or tt > 900.0:
+        return W_TILDE_EARLY
+    if tt > 300.0:
+        return W_TILDE_MID
+    if tt > 60.0:
+        return W_TILDE_LATE
+    return W_TILDE_TURBO
+
+
+def effective_poll_ttl(post_dt, base_ttl: float) -> float:
+    """Throttle the poll cadence: 0.8s inside the final window, base otherwise."""
+    st = execution_state(post_dt)
+    if st in ("TURBO_APPROACH", "LOADING_DELAY"):
+        return TURBO_TTL_S
+    return float(base_ttl)
+
+
+def bayesian_fusion(p_model: np.ndarray, p_market: np.ndarray, w: float,
+                    delta_flow: Optional[np.ndarray] = None) -> np.ndarray:
+    """Time-varying logit fusion:
+
+        logit(P_final) = (1-w) * logit(P_model) + w * logit(P_market)
+                         + delta_flow
+
+    followed by a field softmax so sum(P_final) == 1. NaN-safe per runner:
+    a missing model prob falls back to the market component and vice versa.
+    """
+    pm = np.asarray(p_model, dtype=float)
+    pk = np.asarray(p_market, dtype=float)
+    n = max(len(pm), len(pk))
+    pm = np.resize(pm, n)
+    pk = np.resize(pk, n)
+    df_ = np.zeros(n) if delta_flow is None else np.asarray(delta_flow, dtype=float)
+
+    def _logit(p: np.ndarray) -> np.ndarray:
+        pc = np.clip(p, 1e-12, 1.0 - 1e-12)
+        out = np.log(pc / (1.0 - pc))
+        out[~np.isfinite(p)] = np.nan
+        return out
+
+    lm = _logit(pm)
+    lk = _logit(pk)
+    fused = np.full(n, np.nan)
+    for i in range(n):
+        parts: list = []
+        weights: list = []
+        if np.isfinite(lm[i]):
+            parts.append(lm[i])
+            weights.append(1.0 - w)
+        if np.isfinite(lk[i]):
+            parts.append(lk[i])
+            weights.append(w)
+        if weights:
+            ws = sum(weights)
+            fused[i] = sum(x * wt for x, wt in zip(parts, weights)) / ws + df_[i]
+    valid = np.isfinite(fused)
+    if not valid.any():
+        return np.full(n, np.nan)
+    e = np.where(valid, np.exp(fused - np.nanmax(fused)), 0.0)
+    return e / e.sum()
+
+
+def _odds_velocity(sub: pd.DataFrame, window_s: float = FLOW_WINDOW_S) -> dict:
+    """horse_number -> {'v90': rel odds change over the window,
+                         'wp_contract': win/place ratio contracted}.
+
+    v90 = (O_now - O_base) / O_base (fraction over ~90s). A sharp drop
+    (<= FLOW_STEAM_V) with a contracting O_W/O_P ratio is an active syndicate
+    steam - the O_W/O_P test filters pure pool noise.
+    """
+    out: dict = {}
+    try:
+        s = sub.copy()
+        s['epoch'] = pd.to_numeric(s['epoch'], errors='coerce')
+        s = s.dropna(subset=['epoch'])
+        if len(s) < 2:
+            return out
+        eras = sorted(s['epoch'].unique())
+        cur_e = eras[-1]
+        cutoff = time.time() - window_s
+        past = [e for e in eras if e <= cutoff]
+        base_e = past[-1] if past else eras[0]
+        if base_e == cur_e:
+            return out
+
+        def frame(e: float) -> dict:
+            f = s[s['epoch'] == e]
+            m = {}
+            for _, r in f.iterrows():
+                try:
+                    hn = int(r['horse_number'])
+                except (TypeError, ValueError):
+                    continue
+                w = pd.to_numeric(pd.Series([r.get('win_odds')]), errors='coerce').iloc[0]
+                p = pd.to_numeric(pd.Series([r.get('place_odds')]), errors='coerce').iloc[0]
+                m[hn] = (w, p)
+            return m
+
+        base = frame(base_e)
+        cur = frame(cur_e)
+        for hn, (ow, op) in cur.items():
+            if hn not in base or pd.isna(ow) or ow <= 0:
+                continue
+            bw, bp = base[hn]
+            if pd.isna(bw) or bw <= 0:
+                continue
+            v90 = (float(ow) - float(bw)) / float(bw)
+            wp_contract = False
+            if pd.notna(op) and pd.notna(bp) and op > 0 and bp > 0:
+                wp_contract = (float(ow) / float(op)) < (float(bw) / float(bp))
+            out[hn] = {'v90': v90, 'wp_contract': wp_contract}
+    except Exception as e:
+        print(f"odds velocity failed: {e}")
+    return out
+
+
 _form_cache = None
 
 
@@ -496,8 +706,11 @@ def _henery_rank(p: np.ndarray, r: int, gamma: float = HENERY_GAMMA) -> np.ndarr
     return res
 
 
-def rank_order_probs(p: np.ndarray) -> dict:
-    """Exact Henery (gamma=0.81) rank-order marginals for a calibrated win vector.
+def rank_order_probs(p: np.ndarray, gamma: Optional[float] = None) -> dict:
+    """Exact Henery rank-order marginals for a calibrated win vector.
+
+    gamma (order-statistic discount) is chosen DYNAMICALLY from field size in
+    [0.75, 0.88] when not supplied explicitly (henery_gamma_for_field).
 
     Returns dict of (n,) arrays (NaN where undefined, e.g. n < rank):
       p1, p2, p3, p4        = P(finish exactly 1st/2nd/3rd/4th)
@@ -506,6 +719,8 @@ def rank_order_probs(p: np.ndarray) -> dict:
       n >= 7  -> place pays TOP 3, 4-6 -> TOP 2, n < 4 -> place pool closed.
     """
     p = np.asarray(p, dtype=float)
+    if gamma is None:
+        gamma = henery_gamma_for_field(len(p))
     finite = np.isfinite(p) & (p > 0)
     pv = np.where(finite, p, 0.0)
     if pv.sum() > 0:
@@ -609,8 +824,9 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
         _post = race_post_time(date_str, venue, race_no)
     except Exception:
         _post = None
-    race_closed = False
     store = snap_store(date_str, venue)
+    sub = pd.DataFrame()
+    exec_state = execution_state(_post)
     baseline, polls_n, open_age_min = None, 0, None
     recent_base = None
     prev_w_map, prev_p_map = {}, {}
@@ -660,8 +876,11 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
                     if pd.notna(p):
                         prev_p_map[hn] = float(p)
             # CLOSED only when post time passed AND the pool stopped ticking
-            if _post is not None and datetime.now(timezone(timedelta(hours=8))) >= _post:
-                race_closed = _market_frozen(sub)
+            # (4-state lifecycle; a still-ticking market stays LOADING_DELAY).
+            exec_state = execution_state(_post, sub)
+    race_closed = (exec_state == "OFFICIAL_CLOSED")
+    t_tilde = t_tilde_seconds(_post)
+    w_fuse = fusion_weight(_post, exec_state)
 
     # --- Excise invalid runners BEFORE softmax / smart money / Kelly ---
     valid = _valid_odds_mask(merged['win_odds'], merged.get('place_odds'))
@@ -684,8 +903,12 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
         out['tick_delta_place'] = np.nan
         for c in ['p_rank1', 'p_rank2', 'p_rank3', 'p_rank4',
                   'p_top2', 'p_top3', 'p_top4', 'place_prob', 'place_ev',
-                  'pace_scenario', 'pace_n_leaders']:
+                  'pace_scenario', 'pace_n_leaders',
+                  'fused_weight', 'delta_flow', 't_tilde',
+                  'syndicate_steam', 'divergence_trap',
+                  'smart_place_absorption']:
             out[c] = np.nan
+        out['exec_state'] = exec_state
         out['polls_n'] = polls_n
         out['open_age_min'] = open_age_min
         return out
@@ -723,12 +946,48 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
             except Exception as e:
                 print(f"recent-flow overlay failed: {e}")
         scored.index = work.index          # merge() resets index - restore so the
-        work = apply_smart_money_bayesian_update(scored)   # .loc merge-back below aligns
-        prob_col, ev_col = 'live_prob', 'live_expected_value'
+        work['smart_money_score'] = scored['smart_money_score'].to_numpy(dtype=float)
+        work['flow_signal'] = scored['flow_signal'].astype(object).to_numpy(dtype=object)
     else:
         work['smart_money_score'] = SMART_MONEY_CENTER
         work['flow_signal'] = '➖ STABLE'
-        prob_col, ev_col = 'true_prob', None
+
+    # --- Time-varying Bayesian fusion engine ---------------------------
+    # logit(P_final) = (1-w) logit(P_model) + w logit(P_market) + delta_flow
+    p_model = pd.to_numeric(work.get('true_prob'), errors='coerce')
+    p_mkt = de_vig_market_probs(work['win_odds'])
+    vel = _odds_velocity(sub) if len(sub) else {}
+    work['delta_flow'] = 0.0
+    work['syndicate_steam'] = False
+    work['divergence_trap'] = False
+    delta_flow = np.zeros(len(work))
+    for pos, r in work.iterrows():
+        try:
+            hn = int(r['horse_number'])
+        except (TypeError, ValueError):
+            continue
+        v = vel.get(hn)
+        if v and float(v['v90']) <= FLOW_STEAM_V and bool(v['wp_contract']):
+            strength = min(abs(float(v['v90'])) / abs(FLOW_STEAM_V), 1.0)
+            delta_flow[work.index.get_loc(pos)] = (FLOW_DELTA_MIN
+                + (FLOW_DELTA_MAX - FLOW_DELTA_MIN) * strength)
+            work.at[pos, 'syndicate_steam'] = True
+    pm = p_model.to_numpy(dtype=float)
+    pk = p_mkt.to_numpy(dtype=float)
+    if t_tilde is not None and t_tilde <= TRAP_T_TILDE_S:
+        trap = (pm > TRAP_MODEL_MIN) & np.isfinite(pk) & (pk < TRAP_MARKET_MAX)
+        work['divergence_trap'] = trap
+        delta_flow = np.where(trap, delta_flow + TRAP_LOGIT_PENALTY, delta_flow)
+    fused = bayesian_fusion(pm, pk, w_fuse, delta_flow)
+    work['delta_flow'] = delta_flow
+    work['live_prob'] = fused
+    work['fused_weight'] = w_fuse
+    work['exec_state'] = exec_state
+    work['t_tilde'] = t_tilde if t_tilde is not None else np.nan
+    odds_w = pd.to_numeric(work['win_odds'], errors='coerce')
+    decay_w = odds_w.apply(_decay)
+    work['live_expected_value'] = fused * odds_w * decay_w - 1.0
+    prob_col, ev_col = 'live_prob', 'live_expected_value'
 
     # --- Place (top 2/3) / rank-order marginals (Harville / Plackett-Luce) ---
     # Field-size rule: >=7 runners -> place pays TOP 3; 4-6 -> TOP 2; <4 -> closed.
@@ -745,8 +1004,10 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
     work['place_ev'] = np.nan
     work['pace_scenario'] = pace_scn
     work['pace_n_leaders'] = pace_n
+    work['smart_place_absorption'] = False
     if probs.notna().sum() >= 2:
-        pm = rank_order_probs(probs.to_numpy(dtype=float))
+        pm = rank_order_probs(probs.to_numpy(dtype=float),
+                              gamma=henery_gamma_for_field(len(work)))
         for c, key in [('p_rank1', 'p1'), ('p_rank2', 'p2'), ('p_rank3', 'p3'),
                        ('p_rank4', 'p4'), ('p_top2', 'top2'), ('p_top3', 'top3'),
                        ('p_top4', 'top4')]:
@@ -758,6 +1019,9 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
             work['place_prob'] = pm['top2']
         po = pd.to_numeric(work['place_odds'], errors='coerce')
         work['place_ev'] = work['place_prob'] * po     # EV_place ratio
+        # Win/Place pool-ratio anomaly: heavy place-pool hedging vs the field
+        work['smart_place_absorption'] = smart_place_absorption_mask(
+            probs.to_numpy(dtype=float), po.to_numpy(dtype=float))
 
     # Merge scored rows back; invalid rows carry no model info.
     # NOTE: create the target column as OBJECT dtype first - assigning a string
@@ -767,7 +1031,10 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
                 'smart_money_score', 'flow_signal',
                 'p_rank1', 'p_rank2', 'p_rank3', 'p_rank4',
                 'p_top2', 'p_top3', 'p_top4', 'place_prob', 'place_ev',
-                'pace_scenario', 'pace_n_leaders']:
+                'pace_scenario', 'pace_n_leaders',
+                'fused_weight', 'delta_flow', 't_tilde',
+                'syndicate_steam', 'divergence_trap',
+                'smart_place_absorption', 'exec_state']:
         if col in work.columns:
             out[col] = np.full(len(out), np.nan, dtype=object)
             out.loc[work.index, col] = work[col].astype(object).to_numpy(dtype=object)
@@ -816,18 +1083,31 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
 
 
 def flag_row(row) -> str:
-    prob = row.get('prob')
-    odds = row.get('win_odds')
-    ev = row.get('ev')
-    smart = row.get('smart_money_score', SMART_MONEY_CENTER)
-    try:
-        if prob is None or odds is None or ev is None:
-            return '—'
-        if KELLY_MIN_ODDS <= float(odds) <= KELLY_MAX_ODDS and (float(ev) + 1.0) >= 1.22 \
-                and float(smart) >= 50.0:
-            return '🎯 PRIME'
-        if float(ev) > 0.0 and float(smart) < 40.0:
-            return '⚠️ DRIFT'
-    except (TypeError, ValueError):
+    """Dual-mode betting guardrails (Law 2 - no longshot value traps).
+
+    WIN requires  P_final >= 0.16 AND EV >= 1.15 AND O_W in [2.2, 14.0].
+    EV >= 1.25 with O_W > 14.0 is suppressed as a WIN and routed to the
+    exotics channel (PLACE / QP / TIERCE anchor) instead.
+    """
+    def f(v):
+        try:
+            x = float(v)
+            return x if not np.isnan(x) else None
+        except (TypeError, ValueError):
+            return None
+
+    prob = f(row.get('prob'))
+    odds = f(row.get('win_odds'))
+    ev = f(row.get('ev'))
+    smart = f(row.get('smart_money_score')) or SMART_MONEY_CENTER
+    if prob is None or odds is None or ev is None:
         return '—'
+    ev_ratio = ev + 1.0
+    if (prob >= WIN_MIN_PROB and ev_ratio >= WIN_MIN_EV
+            and WIN_MIN_ODDS <= odds <= WIN_MAX_ODDS and smart >= 50.0):
+        return '🎯 PRIME W'
+    if ev_ratio >= EXOTIC_EV and odds > WIN_MAX_ODDS:
+        return '🎯 EXOTIC'
+    if ev > 0.0 and smart < 40.0:
+        return '⚠️ DRIFT'
     return '—'
