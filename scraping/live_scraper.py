@@ -21,6 +21,12 @@ from scraping.scraper import GRAPHQL_BASE_URL, RACECARD_PROFILE_QUERY
 # key = (date_str, venue, race_num) -> {'title', 'post_hhmm', 'fetched_at'}
 RACE_META: dict = {}
 
+# Heavy auxiliary sources (SpeedPRO / Form Guide / WPQ / Draw Stats) barely
+# change intraday - fetched ONCE per (date, venue, race) and cached for the
+# process lifetime. The live odds loop must NOT reload them per poll (that was
+# the main source of 3-8s poll latency and heavy load).
+_extras_cache: dict = {}
+
 # Cache for formguide which doesn't change often
 _formguide_cache = TTLCache(maxsize=100, ttl=3600)  # 1 hour cache
 
@@ -267,7 +273,7 @@ class BrowserManager:
     Includes recycling (every N live-odds polls or 2h) and a heartbeat so the
     Discord daemon watchdog can detect and respawn a frozen browser.
     """
-    MAX_SCRAPES_BEFORE_RECYCLE = 3
+    MAX_SCRAPES_BEFORE_RECYCLE = 8
     MAX_AGE_SECONDS = 2 * 3600
 
     def __init__(self):
@@ -625,11 +631,11 @@ async def scrape_live_odds(date_str, venue="S1", race_num=1, time_to_post: Optio
         # Wait for the odds table to load
         from playwright.async_api import TimeoutError
         try:
-            await page.wait_for_selector('.rc-odds-table', timeout=15000)
+            await page.wait_for_selector('.rc-odds-table', timeout=8000)
         except TimeoutError:
             print(f"Timeout waiting for odds table at {url}. Odds might not be available yet.")
             return None
-        await asyncio.sleep(2) # Give it a moment to populate odds
+        await asyncio.sleep(0.4) # give the table a moment to populate (was 2s)
         
         content = await page.content()
         soup = BeautifulSoup(content, 'html.parser')
@@ -718,35 +724,41 @@ async def scrape_live_odds(date_str, venue="S1", race_num=1, time_to_post: Optio
         df['race_number'] = race_num
         df['venue'] = venue
 
-        # Add SpeedPRO data and Draw Statistics
-        try:
-            print("Fetching SpeedPRO ratings, Form Guide, WPQ, and Draw Stats...")
-            speedpro_result, formguide_data, wpq_str, draw_stats = await asyncio.gather(
-                scrape_speedpro(race_num),
-                scrape_speedpro_formguide(race_num),
-                scrape_live_wpq(date_str, venue, race_num),
-                scrape_draw_statistics(race_num)
-            )
-            
-            speedpro_data, speedpro_images = speedpro_result
+        # Add SpeedPRO data and Draw Statistics - cached per race per process
+        extras = _extras_cache.get((date_str, venue, int(race_num)))
+        if extras is None:
+            try:
+                print(f"Fetching SpeedPRO / FormGuide / WPQ / DrawStats for {venue} R{race_num} (cached)...")
+                speedpro_result, formguide_data, wpq_str, draw_stats = await asyncio.gather(
+                    scrape_speedpro(race_num),
+                    scrape_speedpro_formguide(race_num),
+                    scrape_live_wpq(date_str, venue, race_num),
+                    scrape_draw_statistics(race_num)
+                )
+                speedpro_data, speedpro_images = speedpro_result
+                extras = {
+                    'speedpro_energy': speedpro_data,
+                    'formguide_remarks': formguide_data,
+                    'draw_win_pct': {int(k): v.get('draw_win_pct') for k, v in draw_stats.items()},
+                    'draw_place_pct': {int(k): v.get('draw_place_pct') for k, v in draw_stats.items()},
+                    'wpq_str': wpq_str,
+                    'speedpro_images': speedpro_images,
+                }
+                _extras_cache[(date_str, venue, int(race_num))] = extras
+            except Exception as e:
+                print(f"Skipping extra sources due to error: {e}")
+                extras = {'speedpro_energy': {}, 'formguide_remarks': {},
+                          'draw_win_pct': {}, 'draw_place_pct': {},
+                          'wpq_str': '', 'speedpro_images': []}
 
-            df['speedpro_energy'] = df['horse_name'].map(lambda name: speedpro_data.get(name.upper(), None))
-            df['formguide_remarks'] = df['horse_name'].map(lambda name: formguide_data.get(name.upper(), ""))
-            
-            # Map draw stats to runners based on their barrier_draw
-            df['draw_win_pct'] = df['barrier_draw'].map(lambda draw: draw_stats.get(draw, {}).get('draw_win_pct', None) if pd.notna(draw) else None)
-            df['draw_place_pct'] = df['barrier_draw'].map(lambda draw: draw_stats.get(draw, {}).get('draw_place_pct', None) if pd.notna(draw) else None)
-
-            df.attrs['wpq_str'] = wpq_str
-            df.attrs['speedpro_images'] = speedpro_images
-        except Exception as e:
-            print(f"Skipping extra sources due to error: {e}")
-            df['speedpro_energy'] = None
-            df['formguide_remarks'] = ""
-            df['draw_win_pct'] = None
-            df['draw_place_pct'] = None
-            df.attrs['wpq_str'] = ""
-            df.attrs['speedpro_images'] = []
+        df['speedpro_energy'] = df['horse_name'].map(
+            lambda name: extras['speedpro_energy'].get(name.upper()))
+        df['formguide_remarks'] = df['horse_name'].map(
+            lambda name: extras['formguide_remarks'].get(name.upper(), ""))
+        df['draw_win_pct'] = df['barrier_draw'].map(lambda draw: extras['draw_win_pct'].get(int(draw)) if pd.notna(draw) else None)
+        df['draw_place_pct'] = df['barrier_draw'].map(lambda draw: extras['draw_place_pct'].get(int(draw)) if pd.notna(draw) else None)
+        df.attrs['wpq_str'] = extras['wpq_str']
+        df.attrs['speedpro_images'] = extras['speedpro_images']
 
         # Persist this poll to memory + disk snapshot store (real-data audit trail)
         await persist_odds_snapshot(date_str, venue, race_num, df, time_to_post=time_to_post)

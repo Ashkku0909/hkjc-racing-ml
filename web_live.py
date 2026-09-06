@@ -147,7 +147,12 @@ def de_vig_market_probs(win_odds: pd.Series) -> pd.Series:
 
 def poll_race(date_str: str, venue: str, race_no: int, ttl: float):
     """Real poll with per-race TTL + SINGLE-FLIGHT: concurrent reruns share the
-    same in-flight scrape instead of stacking duplicate browser sessions."""
+    same in-flight scrape instead of stacking duplicate browser sessions.
+
+    LOW-LATENCY: while a scrape is already in flight, reruns serve the LAST
+    GOOD frame immediately instead of blocking on the network (the in-flight
+    call is the only one that waits, and it refreshes the cache on completion).
+    """
     key = (date_str, venue, race_no)
     now = time.time()
     hit = _poll_cache.get(key)
@@ -156,10 +161,11 @@ def poll_race(date_str: str, venue: str, race_no: int, ttl: float):
 
     inf = _inflight.get(key)
     if inf is not None and now - inf[0] < 45.0:
+        # a poll is already running - never block the UI rerun on it
         try:
-            return inf[1].result(timeout=SCRAPE_TIMEOUT)
+            return hit[1] if hit is not None else inf[1].result(timeout=SCRAPE_TIMEOUT)
         except Exception:
-            pass
+            return hit[1] if hit is not None else None
 
     fut = run_async(scrape_live_odds(date_str, venue, race_no))
     _inflight[key] = (now, fut)
