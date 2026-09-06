@@ -27,6 +27,12 @@ RACE_META: dict = {}
 # the main source of 3-8s poll latency and heavy load).
 _extras_cache: dict = {}
 
+# Reusable Playwright pages per race. Creating a new context + page per poll
+# costs ~300-500ms; the odds SPA only needs the SAME page navigated again.
+# Pages are dropped when the browser is recycled (TargetClosedError then
+# forces a fresh page on the next poll).
+_odds_page_cache: dict = {}
+
 # Cache for formguide which doesn't change often
 _formguide_cache = TTLCache(maxsize=100, ttl=3600)  # 1 hour cache
 
@@ -273,7 +279,7 @@ class BrowserManager:
     Includes recycling (every N live-odds polls or 2h) and a heartbeat so the
     Discord daemon watchdog can detect and respawn a frozen browser.
     """
-    MAX_SCRAPES_BEFORE_RECYCLE = 8
+    MAX_SCRAPES_BEFORE_RECYCLE = 16
     MAX_AGE_SECONDS = 2 * 3600
 
     def __init__(self):
@@ -328,6 +334,7 @@ class BrowserManager:
     async def recycle(self) -> None:
         """Tears down the current browser; the next get_browser() respawns fresh."""
         print("Recycling Playwright browser (memory hygiene).")
+        _odds_page_cache.clear()
         await self.close()
 
 
@@ -624,10 +631,21 @@ async def scrape_live_odds(date_str, venue="S1", race_num=1, time_to_post: Optio
     mark_scrape_started()
 
     browser = await browser_manager.get_browser()
-    page = await browser.new_page()
-        
+    pkey = (date_str, venue, int(race_num))
+    page = _odds_page_cache.get(pkey)
     try:
-        await page.goto(url, timeout=60000)
+        if page is None or page.is_closed():
+            page = await browser.new_page()
+            _odds_page_cache[pkey] = page
+    except Exception:
+        # browser was recycled under us - rebuild
+        page = await browser.new_page()
+        _odds_page_cache[pkey] = page
+
+    try:
+        # domcontentloaded: the odds table is client-rendered, so waiting for
+        # 'load' (ads/images) only wastes ~0.5-1s per poll.
+        await page.goto(url, timeout=60000, wait_until="domcontentloaded")
         # Wait for the odds table to load
         from playwright.async_api import TimeoutError
         try:
@@ -635,7 +653,7 @@ async def scrape_live_odds(date_str, venue="S1", race_num=1, time_to_post: Optio
         except TimeoutError:
             print(f"Timeout waiting for odds table at {url}. Odds might not be available yet.")
             return None
-        await asyncio.sleep(0.4) # give the table a moment to populate (was 2s)
+        await asyncio.sleep(0.15) # give the table a moment to populate (was 2s)
         
         content = await page.content()
         soup = BeautifulSoup(content, 'html.parser')
@@ -768,7 +786,13 @@ async def scrape_live_odds(date_str, venue="S1", race_num=1, time_to_post: Optio
         print(f"Error scraping live odds: {e}")
         return None
     finally:
-        await page.close()
+        # Keep the page alive for the next poll (reused via _odds_page_cache);
+        # if the browser was recycled the cached page dies with it.
+        try:
+            if page is not None and page.is_closed():
+                _odds_page_cache.pop(pkey, None)
+        except Exception:
+            _odds_page_cache.pop(pkey, None)
         mark_scrape_finished()
         # Memory hygiene: recycle ONLY when no other scrape is in flight
         try:
