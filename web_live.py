@@ -21,7 +21,7 @@ from scraping.live_scraper import scrape_live_odds, load_odds_snapshots, RACE_ME
 from bot.analyzer_service import (
     get_data, merge_live_odds_with_predictions,
     calculate_smart_money_metrics, apply_smart_money_bayesian_update,
-    SMART_MONEY_CENTER,
+    get_flow_signal, SMART_MONEY_CENTER,
 )
 from modeling.model_training import EDGE_DECAY_C, EDGE_DECAY_GAMMA
 
@@ -39,6 +39,11 @@ LIVE_FIELD_TAU = 1.75
 # sum p^gamma (gamma = 0.81) - fixes Harville's systematic OVER-estimation of
 # place chances for extreme longshots (O >= 10).
 HENERY_GAMMA = 0.81
+# Rolling smart-money window: flow is also measured against the snapshot closest
+# to (now - RECENT_FLOW_WINDOW_S) so mid-session surges trigger regardless of
+# when the board booted (day-open baseline alone stays flat if the app started
+# mid-market, e.g. the 09:14 UTC store captured after the overnight move).
+RECENT_FLOW_WINDOW_S = 600.0
 SCRAPE_TIMEOUT = 45.0
 MAX_RACES = 12
 FOCUS_TTL = 5.0
@@ -562,6 +567,7 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
     # --- TRUE baseline: first valid post-open snapshot per horse ---
     store = snap_store(date_str, venue)
     baseline, polls_n, open_age_min = None, 0, None
+    recent_base = None
     prev_w_map, prev_p_map = {}, {}
     if len(store):
         sub = store[store['race_id'] == race_id].copy()
@@ -574,11 +580,29 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
                     open_age_min = (time.time() - float(sub['epoch'].min())) / 60.0
                 except Exception:
                     open_age_min = None
+            # rolling baseline: snapshot closest to (now - window); falls back to
+            # the earliest epoch when the store is younger than the window.
+            eras = sorted(sub['epoch'].dropna().unique())
+            cutoff = time.time() - RECENT_FLOW_WINDOW_S
+            eras_in = [e for e in eras if e >= cutoff]
+            anchor = eras_in[0] if eras_in else (eras[0] if eras else None)
+            if anchor is not None:
+                rows = []
+                fr = sub[sub['epoch'] == anchor]
+                for _, r in fr.iterrows():
+                    try:
+                        hn = int(r['horse_number'])
+                    except (TypeError, ValueError):
+                        continue
+                    if pd.notna(r.get('win_odds')):
+                        rows.append({'horse_number': hn,
+                                     'horse_name': r.get('horse_name', ''),
+                                     'win_odds': float(r['win_odds'])})
+                recent_base = pd.DataFrame(rows)
             # tick-delta sources: the PREVIOUS poll (second-latest epoch) so the
             # terminal can flash on every tick: delta = O_t - O_{t-1}
-            epochs = sorted(sub['epoch'].dropna().unique())
-            if len(epochs) >= 2:
-                prev_frame = sub[sub['epoch'] == epochs[-2]]
+            if len(eras) >= 2:
+                prev_frame = sub[sub['epoch'] == eras[-1 - 1]]
                 for _, r in prev_frame.iterrows():
                     try:
                         hn = int(r['horse_number'])
@@ -633,6 +657,22 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
 
     if baseline is not None and len(baseline):
         scored = calculate_smart_money_metrics(work, baseline)
+        # rolling-window overlay: keep the stronger real signal so mid-session
+        # surges trigger (choose the score with the larger |S - 50|).
+        if recent_base is not None and len(recent_base) and len(recent_base) >= 2:
+            try:
+                scored_recent = calculate_smart_money_metrics(work, recent_base)
+                s_tot = scored['smart_money_score'].to_numpy(dtype=float)
+                s_rec = scored_recent['smart_money_score'].to_numpy(dtype=float)
+                use_rec = np.abs(s_rec - SMART_MONEY_CENTER) > np.abs(s_tot - SMART_MONEY_CENTER)
+                scored['smart_money_score'] = np.where(use_rec, s_rec, s_tot)
+                scored['odds_prob_delta'] = np.where(
+                    use_rec,
+                    scored_recent['odds_prob_delta'].to_numpy(dtype=float),
+                    scored['odds_prob_delta'].to_numpy(dtype=float))
+                scored['flow_signal'] = [get_flow_signal(x) for x in scored['smart_money_score']]
+            except Exception as e:
+                print(f"recent-flow overlay failed: {e}")
         scored.index = work.index          # merge() resets index - restore so the
         work = apply_smart_money_bayesian_update(scored)   # .loc merge-back below aligns
         prob_col, ev_col = 'live_prob', 'live_expected_value'

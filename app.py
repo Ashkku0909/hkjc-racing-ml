@@ -541,8 +541,9 @@ ensure_data_loaded()
 today = datetime.now(HKT)
 with st.sidebar:
     st.markdown("### ⚙️ Terminal Controls")
+    # Race-day default: TODAY (not tomorrow) - the terminal is for the live card.
     date_str = st.text_input("Race day (YYYY-MM-DD)",
-                             value=(today + timedelta(days=1)).strftime("%Y-%m-%d"))
+                             value=today.strftime("%Y-%m-%d"))
     venue = st.selectbox("Venue", ["ST", "HV"], index=0)
     poll_s = st.select_slider("Active race poll (s)", options=[1, 2], value=1)
     auto = st.checkbox("Auto-refresh", value=True)
