@@ -36,8 +36,9 @@ import web_live
 from web_live import (
     ensure_data_loaded, poll_race, card_size, score_race, flag_row,
     de_vig_market_probs, race_post_time, snap_store, SLOW_TTL,
-    effective_poll_ttl,
+    effective_poll_ttl, race_meta,
 )
+from scraping.live_scraper import _extras_cache
 
 HKT = timezone(timedelta(hours=8))
 PRIME_COLOR = "#FFD700"
@@ -492,6 +493,139 @@ def render_focus(scored, race_no):
             f'model top-3 = {", ".join(lm)} · market top-3 = {", ".join(lk)}'
             + (f' · divergent: {", ".join(ld)}' if div else '') + '</div>',
             unsafe_allow_html=True)
+
+    # --- LLM export (full race intel as one Markdown file) ---
+    date_str = str(scored.iloc[0].get('race_date')) if len(scored) else ''
+    venue = str(scored.iloc[0].get('venue')) if len(scored) else ''
+    if date_str and venue:
+        report = build_llm_report(scored, date_str, venue, race_no)
+        st.download_button(
+            "📄 Download LLM Report (.md)",
+            data=report,
+            file_name=f"hkjc_{date_str}_{venue}_Race{race_no}.md",
+            mime="text/markdown",
+        )
+
+
+def build_llm_report(scored, date_str, venue, race_no) -> str:
+    """One Markdown file with EVERYTHING the board knows about the race
+    (SpeedPRO energy, form remarks, draw stats, jockey/trainer, model/market
+    probabilities, smart flow) - ready to upload to an external LLM."""
+    now = hkt_now()
+    meta = race_meta(date_str, venue, int(race_no))
+    title = re.sub(r'\s+', ' ', str((meta or {}).get('title') or '')).strip()
+    post = race_post_time(date_str, venue, int(race_no))
+    countdown = fmt_tminus((post - now) if post is not None else None)
+    n = len(scored)
+    exec_state = str(scored.iloc[0].get('exec_state') or '') if n else ''
+    race_closed = bool(scored.iloc[0].get('race_closed')) if n else False
+    pace = str(scored.iloc[0].get('pace_scenario') or 'NORMAL') if n else 'NORMAL'
+    n_lead = numf(scored.iloc[0].get('pace_n_leaders')) if n else None
+    valid = scored[~scored['unposted']] if 'unposted' in scored else scored
+    overrun = None
+    if len(valid):
+        o = pd.to_numeric(valid['win_odds'], errors='coerce')
+        o = o[o.notna() & (o >= 1.0)]
+        if len(o):
+            overrun = float((1.0 / o).sum() - 1.0) * 100.0
+    thin = (race_closed or len(valid) < 8 or overrun is None or overrun < 15.0)
+    extras = _extras_cache.get((date_str, venue, int(race_no))) or {}
+    wpq = str(extras.get('wpq_str') or '').strip()
+    n_img = len(extras.get('speedpro_images') or [])
+    vn = {'ST': 'Sha Tin', 'HV': 'Happy Valley'}.get(str(venue).upper(), str(venue))
+
+    def pct(x) -> str:
+        v = numf(x)
+        return f"{v * 100:.1f}%" if v is not None else '—'
+
+    L: list = []
+    L.append(f"# HKJC Race Report — {date_str} {vn} R{race_no}")
+    L.append("")
+    L.append(f"- **Race title**: {title or '—'}")
+    L.append(f"- **Venue**: {vn} | **Race no**: {race_no}")
+    L.append(f"- **Post time (HKT)**: {post.strftime('%H:%M') if post else '—'} | "
+             f"**Generated**: {now.strftime('%Y-%m-%d %H:%M:%S')} HKT | **Countdown**: {countdown}")
+    L.append(f"- **Execution state**: {exec_state} | **Race closed**: {race_closed}")
+    L.append(f"- **Valid runners**: {len(valid)}/{n} | **Overround**: "
+             f"{overrun:+.1f}%" if overrun is not None else "- **Valid runners**: "
+             f"{len(valid)}/{n} | **Overround**: —")
+    L[-1] += f" | **Pace**: {pace}" + (f" ({n_lead:.0f} leaders)" if n_lead is not None else "")
+    L.append(f"- **Thin liquidity**: {thin}")
+    L.append("")
+
+    order = scored.copy()
+    order['_prob'] = pd.to_numeric(order.get('prob'), errors='coerce').fillna(0.0)
+    order = order.sort_values('_prob', ascending=False)
+    for i, (_, r) in enumerate(order.iterrows(), 1):
+        name = str(r.get('horse_name') or '—')
+        no = r.get('horse_number')
+        d = r.get('barrier_draw')
+        no_s = f"#{int(no)}" if pd.notna(no) else "#?"
+        d_s = f"[D{int(d)}]" if pd.notna(d) else "[D?]"
+        unposted = bool(r.get('unposted'))
+        jt = str(r.get('jockey') or '—')
+        tr = str(r.get('trainer') or '—')
+        wt = numf(r.get('weight_carried'))
+        w = numf(r.get('win_odds'))
+        p = numf(r.get('place_odds'))
+        w_td = numf(r.get('tick_delta'))
+        p_td = numf(r.get('tick_delta_place'))
+        sp = numf(r.get('speedpro_energy'))
+        frm = str(r.get('formguide_remarks') or '').strip()
+        dw = numf(r.get('draw_win_pct'))
+        dp = numf(r.get('draw_place_pct'))
+        smart = numf(r.get('smart_money_score'))
+        ev = numf(r.get('ev'))
+        pev = numf(r.get('place_ev'))
+        kelly = numf(r.get('kelly'))
+        f3 = str(r.get('last3_form') or '—')
+        flow = str(r.get('flow_signal') or 'STABLE')
+        flags = []
+        if bool(r.get('syndicate_steam')):
+            flags.append('SYNDICATE_STEAM')
+        if bool(r.get('divergence_trap')):
+            flags.append('DIVERGENCE_TRAP')
+        if bool(r.get('smart_place_absorption')):
+            flags.append('SMART_PLACE_ABSORPTION')
+        L.append(f"## {i}. {name} ({no_s} {d_s})" + (" — PRE-OPEN" if unposted else ""))
+        L.append(f"- **Jockey**: {jt} | **Trainer**: {tr} | "
+                 f"**Weight**: {f'{wt:.0f}' if wt is not None else '—'} | **Draw**: {d_s}")
+        L.append(f"- **Win odds**: {w if w is not None else '—'}"
+                 + (f" (Δ {w_td:+.1f})" if w_td is not None else "")
+                 + f" | **Place odds**: {p if p is not None else '—'}"
+                 + (f" (Δ {p_td:+.2f})" if p_td is not None else ""))
+        L.append(f"- **SpeedPRO Energy**: {f'{sp:.0f}' if sp is not None else '—'} | "
+                 f"**Draw stats**: win {f'{dw:.1f}%' if dw is not None else '—'} / "
+                 f"place {f'{dp:.1f}%' if dp is not None else '—'}")
+        if frm:
+            L.append(f"- **Form remarks**: {frm}")
+        L.append(f"- **Model prob**: {pct(r.get('prob'))} | "
+                 f"**Market (de-vig)**: {pct(r.get('mkt_prob'))} | "
+                 f"**Top3**: {pct(r.get('p_top3'))} | "
+                 f"**Place EV**: ×{(pev if pev is not None else float('nan')):.3f}" if pev is not None
+                 else f"- **Model prob**: {pct(r.get('prob'))} | "
+                 f"**Market (de-vig)**: {pct(r.get('mkt_prob'))} | "
+                 f"**Top3**: {pct(r.get('p_top3'))} | **Place EV**: —")
+        L.append(f"- **EV ratio**: ×{(ev + 1.0) if ev is not None else float('nan'):.3f}" if ev is not None
+                 else "- **EV ratio**: —")
+        L.append(f"- **Kelly**: {f'{kelly * 100:.2f}%' if kelly is not None else '—'} | "
+                 f"**Smart money**: S {f'{smart:.0f}' if smart is not None else '—'} {flow}")
+        L.append(f"- **Verdict**: {verdict_of(r)[1]}"
+                 + (f" | **Flags**: {', '.join(flags)}" if flags else ""))
+        L.append(f"- **Last 3 runs**: {f3}")
+        L.append("")
+
+    if wpq:
+        L.append("## Win / Place Quinella (WPQ)")
+        L.append("")
+        L.append(wpq)
+        L.append("")
+    if n_img:
+        L.append(f"- SpeedPRO chart images captured on the board: {n_img} "
+                 f"(base64, not embedded in this file)")
+    L.append("---")
+    L.append("Generated by HKJC Quant Terminal — educational use only.")
+    return "\n".join(L)
 
 
 # ----------------------------------------------------------------------
