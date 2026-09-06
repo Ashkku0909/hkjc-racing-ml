@@ -174,6 +174,17 @@ def num(v, fallback="—"):
         return fallback
 
 
+def numf(v):
+    """Numeric-only: returns float or None (NEVER a display string), safe for
+    arithmetic/formatting. Use this everywhere math is applied."""
+    try:
+        if v is None or pd.isna(v):
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def horse_label(r, html=True):
     """Saddlecloth law: horses are ALWAYS shown as 'NAME (#N)' or 'NAME (#2 [D12])'."""
     name = str(r.get('horse_name') or '—')
@@ -382,13 +393,15 @@ def render_focus(scored, race_no):
         row_cls = "qt-row preopen" if kind[0] == 'preopen' else ("qt-row prime" if kind[0] == 'prime' else "qt-row")
         odds = num(r.get('win_odds'))
         place = num(r.get('place_odds'))
-        prob = num(r.get('prob'))
-        mkt = num(r.get('mkt_prob'))
-        evr = num(r.get('ev'))
+        prob = numf(r.get('prob'))
+        mkt = numf(r.get('mkt_prob'))
+        evr = numf(r.get('ev'))
         evx = evr + 1.0 if evr is not None else None
-        pev = num(r.get('place_ev'))
-        p3 = num(r.get('p_top3'))
-        smart = num(r.get('smart_money_score'), 50.0)
+        pev = numf(r.get('place_ev'))
+        p3 = numf(r.get('p_top3'))
+        smart = numf(r.get('smart_money_score'))
+        if smart is None:
+            smart = 50.0
         mp = f"{prob * 100:.1f}%" if prob is not None else "—"
         kp = f"{mkt * 100:.1f}%" if mkt is not None else "—"
         t3pct = f"{p3 * 100:.1f}%" if p3 is not None else "—"
@@ -396,8 +409,8 @@ def render_focus(scored, race_no):
         kbar = min(100.0, (mkt or np.nan) * 100) if mkt is not None else 0.0
         evtxt = f"×{evx:.3f}" if evx is not None else "—"
         pevtxt = f"×{pev:.3f}" if pev is not None else "—"
-        w_td = num(r.get('tick_delta'))
-        p_td = num(r.get('tick_delta_place'))
+        w_td = numf(r.get('tick_delta'))
+        p_td = numf(r.get('tick_delta_place'))
         w_flag = win_prime(r)
         pp_flag = place_prime(r)
         vt_cls = "prime" if kind[0] == 'prime' else ("closed" if kind[0] == 'closed'
@@ -406,7 +419,7 @@ def render_focus(scored, race_no):
         flow_html = ('<span style="color:#6b7a99;">—</span>' if kind[0] == 'closed'
                      else flow_badge(r.get("flow_signal"), smart))
         if kind[0] == 'prime' and ('PRIME W' in kind[1] or 'DUAL' in kind[1]):
-            kr = num(r.get('kelly'))
+            kr = numf(r.get('kelly'))
             if kr is not None:
                 vtxt += f' ({kr * 100:.1f}% BR)'
         jt = str(r.get('jockey') or '—').strip()
@@ -494,8 +507,8 @@ def render_overview(date_str, venue):
         # BEST EV across win & place (ratio form)
         cands = []
         for _, rr in valid.iterrows():
-            evr = num(rr.get('ev'))
-            pev = num(rr.get('place_ev'))
+            evr = numf(rr.get('ev'))
+            pev = numf(rr.get('place_ev'))
             if evr is not None:
                 cands.append((float(evr) + 1.0, 'W', rr))
             if pev is not None:

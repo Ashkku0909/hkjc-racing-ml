@@ -75,6 +75,29 @@ streamlit run app.py
 ```
 </details>
 
+### 📱 Track from your phone (PC stays home)
+
+Double-click **`start_online.bat`** (or run `powershell -ExecutionPolicy Bypass -File start_online.ps1`).
+It starts Streamlit on `0.0.0.0` and opens a **Cloudflare quick tunnel** — it prints a
+public `https://…trycloudflare.com` URL (works anywhere, no router port-forwarding,
+no account needed). Also prints the LAN URL for same-WiFi phones:
+
+- **Same WiFi:** `http://192.168.0.214:8501` (if unreachable, allow inbound port 8501 once, as admin:
+  `New-NetFirewallRule -DisplayName "HKJC Quant Terminal 8501" -Direction Inbound -Protocol TCP -LocalPort 8501 -Action Allow`)
+- **Anywhere (4G/5G):** the printed `https://…trycloudflare.com` URL
+
+> The tunnel URL is public — anyone with the link can view the board.
+
+<details>
+<summary>📋 Manual online launch</summary>
+
+```bash
+streamlit run app.py --server.address 0.0.0.0 --server.enableCORS false --server.enableXsrfProtection false
+# second window:
+%LOCALAPPDATA%\cloudflared\cloudflared.exe tunnel --url http://localhost:8501
+```
+</details>
+
 ---
 
 ## 🖥️ Web App Pages

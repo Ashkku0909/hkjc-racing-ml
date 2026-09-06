@@ -36,6 +36,12 @@ data/log.txt
 # Results / logs
 results*.txt
 
+# Online start script outputs
+streamlit.log
+streamlit.err.log
+tunnel.log
+tunnel.err.log
+
 # Backup folder
 backup/
 
