@@ -44,6 +44,10 @@ HENERY_GAMMA = 0.81
 # when the board booted (day-open baseline alone stays flat if the app started
 # mid-market, e.g. the 09:14 UTC store captured after the overnight move).
 RECENT_FLOW_WINDOW_S = 600.0
+# A race is only CLOSED when its nominal post time has passed AND the quotes
+# have stopped moving for this long. Races run late (13:00 post often starts
+# 13:01+), so a still-ticking market must stay OPEN to capture final flow.
+CLOSED_FROZEN_SEC = 90.0
 SCRAPE_TIMEOUT = 45.0
 MAX_RACES = 12
 FOCUS_TTL = 5.0
@@ -370,6 +374,32 @@ def _apply_pace_adjustment(probs: pd.Series, runner_df) -> tuple:
     return pd.Series(p, index=probs.index), (scenario, n_lead)
 
 
+def _market_frozen(sub: pd.DataFrame, frozen_sec: float = CLOSED_FROZEN_SEC) -> bool:
+    """True iff no win quote has changed for frozen_sec (pool truly closed).
+
+    Nominal post times run early (a 13:00 card often starts 13:01+), so a market
+    that is still ticking must NOT be flagged closed - that would discard the
+    final smart-money surge. Only a frozen pool is 'RACE CLOSED'.
+    """
+    try:
+        eras = sorted(pd.to_numeric(sub['epoch'], errors='coerce').dropna().unique())
+        if len(eras) < 2:
+            return False
+        last_move = float(eras[0])
+        for i in range(len(eras) - 1, 0, -1):
+            e0, e1 = eras[i - 1], eras[i]
+            f0 = sub[sub['epoch'] == e0].set_index('horse_number')['win_odds']
+            f1 = sub[sub['epoch'] == e1].set_index('horse_number')['win_odds']
+            common = f0.index.intersection(f1.index)
+            if len(common) and (pd.to_numeric(f1.loc[common], errors='coerce') !=
+                                pd.to_numeric(f0.loc[common], errors='coerce')).any():
+                last_move = float(e1)
+                break
+        return (time.time() - last_move) >= frozen_sec
+    except Exception:
+        return False
+
+
 _form_cache = None
 
 
@@ -565,15 +595,15 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
         merged['last3_form'] = np.nan
 
     # --- TRUE baseline: first valid post-open snapshot per horse ---
-    # Post-time sentinel: once the official post time has passed the pool is
-    # closed and odds are frozen - no live flow / EV signals can exist (this is
-    # why a finished race's smart money score looks permanently 'stable').
+    # Market-close sentinel: nominal post times run early (a 13:00 card often
+    # starts 13:01+), so 'closed' = post time passed AND quotes frozen for
+    # CLOSED_FROZEN_SEC. A still-ticking market stays OPEN to keep the last
+    # smart-money surges visible (flagged after `sub` is built below).
     try:
         _post = race_post_time(date_str, venue, race_no)
-        race_closed = bool(_post is not None and
-                           datetime.now(timezone(timedelta(hours=8))) >= _post)
     except Exception:
-        race_closed = False
+        _post = None
+    race_closed = False
     store = snap_store(date_str, venue)
     baseline, polls_n, open_age_min = None, 0, None
     recent_base = None
@@ -623,6 +653,9 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
                         prev_w_map[hn] = float(w)
                     if pd.notna(p):
                         prev_p_map[hn] = float(p)
+            # CLOSED only when post time passed AND the pool stopped ticking
+            if _post is not None and datetime.now(timezone(timedelta(hours=8))) >= _post:
+                race_closed = _market_frozen(sub)
 
     # --- Excise invalid runners BEFORE softmax / smart money / Kelly ---
     valid = _valid_odds_mask(merged['win_odds'], merged.get('place_odds'))
