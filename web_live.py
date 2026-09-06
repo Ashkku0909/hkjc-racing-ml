@@ -565,6 +565,15 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
         merged['last3_form'] = np.nan
 
     # --- TRUE baseline: first valid post-open snapshot per horse ---
+    # Post-time sentinel: once the official post time has passed the pool is
+    # closed and odds are frozen - no live flow / EV signals can exist (this is
+    # why a finished race's smart money score looks permanently 'stable').
+    try:
+        _post = race_post_time(date_str, venue, race_no)
+        race_closed = bool(_post is not None and
+                           datetime.now(timezone(timedelta(hours=8))) >= _post)
+    except Exception:
+        race_closed = False
     store = snap_store(date_str, venue)
     baseline, polls_n, open_age_min = None, 0, None
     recent_base = None
@@ -619,6 +628,7 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
     valid = _valid_odds_mask(merged['win_odds'], merged.get('place_odds'))
     work = merged[valid].copy()
     out = merged.copy()
+    out['race_closed'] = race_closed
 
     if len(work) == 0:
         out['prob'] = np.nan

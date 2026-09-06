@@ -112,6 +112,7 @@ st.markdown("""
 .qt-verdict.prime { color:#FFD700; }
 .qt-verdict.pass { color:#9E9E9E; }
 .qt-verdict.preopen { color:#6b7a99; }
+.qt-verdict.closed { color:#FFB300; }
 .qt-note { color:#6b7a99; font-size:11px; margin-top:10px; }
 .qt-up { color:#00E676; }
 .qt-down { color:#FF5252; }
@@ -238,6 +239,8 @@ def place_prime(r) -> bool:
 
 
 def verdict_of(r):
+    if bool(r.get('race_closed')):
+        return 'closed', '🏁 CLOSED'
     if bool(r.get('unposted')):
         return 'preopen', '⏳ PRE-OPEN'
     pw = win_prime(r)
@@ -332,18 +335,23 @@ def render_focus(scored, race_no):
     ])
 
     # --- Pace scenario matrix badge (lagged front-runner density) ---
-    pace_scn = str(scored.iloc[0].get('pace_scenario') or 'NORMAL')
-    pace_n = num(scored.iloc[0].get('pace_n_leaders'), 0.0)
-    if pace_scn == 'MELTDOWN':
-        st.markdown(f'<span class="qt-pace meltdown qt-term">🔥 PACE MELTDOWN '
-                    f'({pace_n:.0f} leaders) — front-runners penalised, closers boosted</span>',
-                    unsafe_allow_html=True)
-    elif pace_scn == 'LONE':
-        st.markdown('<span class="qt-pace lone qt-term">🚀 LONE LEADER (slow bias) '
-                    '— leader logit +0.20</span>', unsafe_allow_html=True)
+    race_closed = bool(scored.iloc[0].get('race_closed')) if len(scored) else False
+    if race_closed:
+        st.markdown('<span class="qt-pace lone qt-term">🏁 RACE CLOSED — odds frozen at '
+                    'official close; no live flow / EV signals.</span>', unsafe_allow_html=True)
     else:
-        st.markdown('<span class="qt-pace normal qt-term">⚖️ NORMAL PACE '
-                    f'({pace_n:.0f} leaders)</span>', unsafe_allow_html=True)
+        pace_scn = str(scored.iloc[0].get('pace_scenario') or 'NORMAL')
+        pace_n = num(scored.iloc[0].get('pace_n_leaders'), 0.0)
+        if pace_scn == 'MELTDOWN':
+            st.markdown(f'<span class="qt-pace meltdown qt-term">🔥 PACE MELTDOWN '
+                        f'({pace_n:.0f} leaders) — front-runners penalised, closers boosted</span>',
+                        unsafe_allow_html=True)
+        elif pace_scn == 'LONE':
+            st.markdown('<span class="qt-pace lone qt-term">🚀 LONE LEADER (slow bias) '
+                        '— leader logit +0.20</span>', unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="qt-pace normal qt-term">⚖️ NORMAL PACE '
+                        f'({pace_n:.0f} leaders)</span>', unsafe_allow_html=True)
 
     # --- Top-4 exotic order banner (model-projected 1st/2nd/3rd/4th) ---
     t4 = scored.dropna(subset=['prob'])
@@ -392,8 +400,11 @@ def render_focus(scored, race_no):
         p_td = num(r.get('tick_delta_place'))
         w_flag = win_prime(r)
         pp_flag = place_prime(r)
-        vt_cls = "prime" if kind[0] == 'prime' else ("preopen" if kind[0] == 'preopen' else "pass")
+        vt_cls = "prime" if kind[0] == 'prime' else ("closed" if kind[0] == 'closed'
+                  else ("preopen" if kind[0] == 'preopen' else "pass"))
         vtxt = kind[1]
+        flow_html = ('<span style="color:#6b7a99;">—</span>' if kind[0] == 'closed'
+                     else flow_badge(r.get("flow_signal"), smart))
         if kind[0] == 'prime' and ('PRIME W' in kind[1] or 'DUAL' in kind[1]):
             kr = num(r.get('kelly'))
             if kr is not None:
@@ -417,7 +428,7 @@ def render_focus(scored, race_no):
             f'<span class="qt-chip p">P {place if place is not None else "—"}{chip_arrow(p_td)}</span>'
             f'<span class="qt-ev-chip {"prime" if pp_flag else ""}">{pevtxt}</span>'
             f'</div>'
-            f'<div class="qt-smart">S {smart:.0f} {flow_badge(r.get("flow_signal"), smart)}</div>'
+            f'<div class="qt-smart">S {smart:.0f} {flow_html}</div>'
             f'<div class="qt-meta"><span class="jt">{esc(jt)}</span> / <span class="jt">{esc(tr)}</span></div>'
             f'<div class="qt-meta"><span class="f3">{esc(f3)}</span></div>'
             f'<div class="qt-verdict {vt_cls}">{vtxt}</div>'
@@ -475,7 +486,9 @@ def render_overview(date_str, venue):
         sm = pd.to_numeric(valid['smart_money_score'], errors='coerce')
         n_valid = int((~sc['unposted']).sum())
         n_pre = int(sc['unposted'].sum())
-        thin = (n_valid < 8) or pd.isna(overrun) or (overrun < 15.0)
+        closed_flag = bool(sc.get('race_closed', pd.Series([False])).iloc[0]) \
+            if len(sc) and 'race_closed' in sc.columns else False
+        thin = closed_flag or (n_valid < 8) or pd.isna(overrun) or (overrun < 15.0)
         # signal counts: steamers + primes across BOTH win and place pools
         primes = int(sum(1 for _, rr in valid.iterrows() if verdict_of(rr)[0] == 'prime'))
         # BEST EV across win & place (ratio form)
@@ -509,18 +522,19 @@ def render_overview(date_str, venue):
         else:
             top4_txt = '—'
         rows.append((rn, (n_valid, n_pre), overrun, best_txt,
-                     (int((sm >= 75).sum()), primes), top4_txt, top_txt, thin))
+                     (int((sm >= 75).sum()), primes), top4_txt, top_txt, thin, closed_flag))
 
     hdr = "".join(f'<span>{c}</span>' for c in
                   ["RACE", "RUNNERS", "OVERRD.", "BEST EV", "SIGNALS",
                    "TOP 4 QUANT SELECTIONS", "TOP VALUE (OVERLAY)"])
     st.markdown(f'<div class="qt-ov-hdr qt-term">{hdr}</div>', unsafe_allow_html=True)
-    for rn, (act, pre), overrun, best_txt, (steam, prime), top4_txt, top_txt, thin in rows:
+    for rn, (act, pre), overrun, best_txt, (steam, prime), top4_txt, top_txt, thin, closed_flag in rows:
         if pd.isna(overrun):
             over_txt = '<span>—</span>'
         else:
             over_txt = f'<span>{overrun:+.1f}%</span>'
-        liq = '<span class="qt-lq"> ⏳ LIQ</span>' if thin else ''
+        liq = ('<span class="qt-lq"> 🏁</span>' if closed_flag
+               else ('<span class="qt-lq"> ⏳ LIQ</span>' if thin else ''))
         runner_txt = f'<span>{act}</span>' + (f'<span style="color:#6b7a99;"> {pre} ⏳</span>' if pre else '')
         st.markdown(
             f'<div class="qt-ov-row qt-term">'
