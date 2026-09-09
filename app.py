@@ -32,6 +32,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 st.set_page_config(page_title="HKJC Quant Terminal", page_icon="🏇", layout="wide",
                    initial_sidebar_state="collapsed")
 
+from modeling.model_training import EDGE_DECAY_C, EDGE_DECAY_GAMMA  # noqa: E402
+
 import web_live
 from web_live import (
     ensure_data_loaded, poll_race, card_size, score_race, flag_row,
@@ -256,14 +258,14 @@ def place_prime(r) -> bool:
     """Prime Place (conservative Henery calibration):
       O_P in [1.8, 4.0] -> EV_place >= 1.15
       O_P > 4.0 (longshot) -> EV_place >= 1.30
-    plus S >= 50."""
-    po = num(r.get('place_odds'))
-    pev = num(r.get('place_ev'))
-    smart = num(r.get('smart_money_score'), 50.0)
+    plus S >= 50. numf: NEVER compare a display string with a float."""
+    po = numf(r.get('place_odds'))
+    pev = numf(r.get('place_ev'))
+    smart = numf(r.get('smart_money_score')) or 50.0
     if po is None or pev is None:
         return False
     if po > 4.0:
-        return 1.8 < po and pev >= 1.30 and smart >= 50
+        return pev >= 1.30 and smart >= 50
     return 1.8 <= po <= 4.0 and pev >= 1.15 and smart >= 50
 
 
@@ -629,6 +631,211 @@ def build_llm_report(scored, date_str, venue, race_no) -> str:
 
 
 # ----------------------------------------------------------------------
+# Today's buy-list card (cold: persisted snapshots + model only, no scrape)
+# ----------------------------------------------------------------------
+def _min_win_odds(p, tgt: float = 1.15):
+    """Decay-aware minimum W odds so EV_ratio = p*O*min((C/O)^gamma,1) >= tgt."""
+    p = numf(p)
+    if p is None or not (0.0 < p < 1.0):
+        return None
+    if p * EDGE_DECAY_C >= tgt:                      # O <= C: decay clamped to 1
+        return tgt / p
+    # O > C: ratio = p * C^gamma * O^(1-gamma)
+    return float((tgt / (p * EDGE_DECAY_C ** EDGE_DECAY_GAMMA)) ** (1.0 / (1.0 - EDGE_DECAY_GAMMA)))
+
+
+def daily_card_rows(date_str: str, venue: str) -> list:
+    """All actionable plays for the day (prime verdicts, non-thin, open races).
+
+    Each entry: tier/conf, race, play (W / P / WP / EX), horse, live odds,
+    EV ratios, decay-aware buy thresholds, smart score and reasons."""
+    store = snap_store(date_str, venue)
+    if len(store) == 0 or 'race_id' not in store.columns:
+        return []
+    nos = set()
+    for rid in store['race_id'].dropna().unique():
+        m = re.match(rf"{re.escape(date_str)}_Race(\d+)$", str(rid))
+        if m:
+            nos.add(int(m.group(1)))
+    picks = []
+    for rn in sorted(nos):
+        sub = store[store['race_id'] == f"{date_str}_Race{rn}"]
+        e = pd.to_numeric(sub['epoch'], errors='coerce').max()
+        if pd.isna(e):
+            continue
+        frame = (sub[sub['epoch'] == e]
+                 [['horse_number', 'horse_name', 'win_odds', 'place_odds']].copy())
+        sc = score_race(frame, date_str, venue, rn)
+        if sc is None or len(sc) == 0 or bool(sc.iloc[0].get('race_closed')):
+            continue
+        valid = sc[~sc['unposted']]
+        o = pd.to_numeric(valid['win_odds'], errors='coerce')
+        o = o[o.notna() & (o >= 1.0)]
+        overrun = float((1.0 / o).sum() - 1.0) * 100.0 if len(o) else float('nan')
+        thin = (len(valid) < 8) or pd.isna(overrun) or (overrun < 15.0)
+        if thin:
+            continue
+        for _, r in valid.iterrows():
+            kind = verdict_of(r)
+            if kind[0] != 'prime':
+                continue
+            odds = numf(r.get('win_odds'))
+            po = numf(r.get('place_odds'))
+            prob = numf(r.get('prob'))
+            place_prob = numf(r.get('place_prob'))
+            ev_w = numf(r.get('ev'))
+            ev_p = numf(r.get('place_ev'))
+            smart = numf(r.get('smart_money_score')) or 50.0
+            if odds is None or prob is None:
+                continue
+            txt = kind[1]
+            if 'DUAL' in txt:
+                play = 'WP'
+            elif 'EXOTIC' in txt:
+                play = 'EX'
+            elif 'PRIME W' in txt:
+                play = 'W'
+            elif 'PRIME P' in txt:
+                play = 'P'
+            else:
+                continue
+            steamish = (smart >= 70.0) or bool(r.get('syndicate_steam'))
+            if play in ('W', 'WP'):
+                cpct = prob * 100.0
+                tier = 'HIGH' if (cpct >= 20.0 or steamish) else 'MED'
+            else:
+                cpct = (place_prob or 0.0) * 100.0
+                tier = 'HIGH' if (cpct >= 40.0 or steamish) else 'MED'
+            buy_w = _min_win_odds(prob, 1.15) if play in ('W', 'WP') else None
+            tgt_p = 1.30 if (po is not None and po > 4.0) else 1.15
+            buy_p = (tgt_p / place_prob) if (play in ('P', 'WP', 'EX')
+                                             and place_prob and place_prob > 0) else None
+            reasons = []
+            if play in ('W', 'WP') and ev_w is not None:
+                reasons.append(f"EV-W ×{ev_w + 1.0:.2f}")
+            if play in ('P', 'WP', 'EX') and ev_p is not None:
+                reasons.append(f"EV-P ×{ev_p:.2f}")
+            if bool(r.get('syndicate_steam')):
+                reasons.append('STEAM')
+            if bool(r.get('smart_place_absorption')):
+                reasons.append('PLACE-ABSORB')
+            if bool(r.get('divergence_trap')):
+                reasons.append('TRAP')
+            if smart >= 75.0:
+                reasons.append('S-HOT')
+            picks.append({
+                'tier': tier,
+                'conf': f"{cpct:.0f}%",
+                'race': rn,
+                'play': play,
+                'horse': horse_label(r, html=False),
+                'w_odds': odds,
+                'p_odds': po,
+                'ev_w': ev_w + 1.0 if ev_w is not None else None,
+                'ev_p': ev_p,
+                'buy_w': buy_w,
+                'buy_p': buy_p,
+                's': smart,
+                'why': ' · '.join(reasons),
+            })
+    picks.sort(key=lambda x: (0 if x['tier'] == 'HIGH' else 1, -(x['ev_w'] or 0.0)))
+    return picks
+
+
+def build_daily_card_md(date_str: str, venue: str, picks=None) -> str:
+    """Professional Markdown of the day's betting plan (downloadable)."""
+    if picks is None:
+        picks = daily_card_rows(date_str, venue)
+    vn = {'ST': 'Sha Tin', 'HV': 'Happy Valley'}.get(str(venue).upper(), str(venue))
+    now = hkt_now()
+
+    def f(v, d=1):
+        return f"{v:.{d}f}" if isinstance(v, (int, float)) else "—"
+
+    L = [f"# HKJC Daily Betting Card — {date_str} {vn}", ""]
+    L.append(f"- **Generated**: {now:%Y-%m-%d %H:%M:%S} HKT")
+    L.append("- **Play types**: W = Win only · P = Place only · "
+             "WP = Win + Place · EX = Exotics (Place / Quinella-Place / Tierce anchor)")
+    L.append("- **Buy W ≥ / Buy P ≥**: minimum odds to still hold the EV edge "
+             "(favourite-longshot decay adjusted).")
+    L.append("")
+    if not picks:
+        L.append("No actionable plays yet — snapshots/models warming up.")
+    else:
+        n_high = sum(1 for p in picks if p['tier'] == 'HIGH')
+        L.append(f"## {len(picks)} Actionable Plays — {n_high} HIGH conviction")
+        L.append("")
+        L.append("| Conf | Race | Play | Horse | W odds | P odds | EV(W) | EV(P) | "
+                 "Buy W ≥ | Buy P ≥ | S | Why |")
+        L.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for p in picks:
+            L.append(f"| {p['tier']} | R{p['race']} | {p['play']} | {p['horse']} | "
+                     f"{f(p['w_odds'])} | {f(p['p_odds'])} | {f(p['ev_w'], 2)} | "
+                     f"{f(p['ev_p'], 2)} | {f(p['buy_w'])} | {f(p['buy_p'])} | "
+                     f"{p['s']:.0f} | {p['why']} |")
+        L.append("")
+        L.append("### HIGH conviction plays")
+        L.append("")
+        for p in [x for x in picks if x['tier'] == 'HIGH']:
+            L.append(f"- **R{p['race']} {p['play']}** — {p['horse']}  "
+                     f"(odds {f(p['w_odds'])}/{f(p['p_odds'])}, confidence {p['conf']}, {p['why']})")
+        L.append("")
+        L.append("### Staking guardrails")
+        L.append("")
+        L.append("- WIN only when P_final ≥ 0.16 AND EV ≥ 1.15 AND O_W ∈ [2.2, 14.0].")
+        L.append("- Longshots (O_W > 14) with EV ≥ 1.25 are NEVER straight WIN — "
+                 "they route to PLACE / QP / TIERCE only.")
+        L.append("- Thin pools (< 8 runners or overround < 15%) carry no staking signal.")
+    L.append("")
+    L.append("---")
+    L.append("Generated by HKJC Quant Terminal — educational use only.")
+    return "\n".join(L)
+
+
+def render_card(date_str: str, venue: str):
+    """Professional daily buy-list summary (cold, snapshot-driven)."""
+    st.markdown('<div class="qt-top4 qt-term" style="margin-top:6px;">'
+                '🎯 TODAY\'S BUY LIST — quant signals · real snapshots · cold 60s</div>',
+                unsafe_allow_html=True)
+    picks = daily_card_rows(date_str, venue)
+    if not picks:
+        st.info("No actionable plays yet — pick race tabs to poll, or wait for pools to open.")
+        return
+    n_high = sum(1 for p in picks if p['tier'] == 'HIGH')
+    kpi_strip([
+        ("Actionable Plays", f"{len(picks)}"),
+        ("HIGH Conviction", f"{n_high}"),
+        ("Races Covered", f"{len(set(p['race'] for p in picks))}"),
+    ])
+    highs = [p for p in picks if p['tier'] == 'HIGH']
+    if highs:
+        parts = []
+        for p in highs[:6]:
+            col = PRIME_COLOR if p['play'] in ('W', 'WP') else '#00E5FF'
+            ow = p['w_odds'] if p['play'] in ('W', 'WP') else p['p_odds']
+            parts.append(f'<span class="r">R{p["race"]}</span> {p["play"]} '
+                         f'<b>{esc(p["horse"])}</b> '
+                         f'<span style="color:{col};">O {f"{ow:.1f}" if ow is not None else "—"}</span> '
+                         f'<span style="color:#8ea2c0;">{p["conf"]}</span>')
+        st.markdown(f'<div class="qt-top4 qt-term" style="font-size:12px;">'
+                    f'💎 HIGH CONVICTION&nbsp;&nbsp;{"&nbsp;·&nbsp;".join(parts)}</div>',
+                    unsafe_allow_html=True)
+    df = pd.DataFrame(picks)
+    show = df[['tier', 'race', 'play', 'horse', 'w_odds', 'p_odds', 'ev_w', 'ev_p',
+               'buy_w', 'buy_p', 's', 'why']].copy()
+    show.columns = ['Conf', 'Race', 'Play', 'Horse', 'W odds', 'P odds',
+                    'EV (W)', 'EV (P)', 'Buy W ≥', 'Buy P ≥', 'S', 'Why']
+    st.dataframe(show, hide_index=True, use_container_width=True,
+                 column_config={
+                     'Horse': st.column_config.TextColumn(width='large'),
+                     'Why': st.column_config.TextColumn(width='large')})
+    st.download_button("📄 Download Today's Card (.md)",
+                       data=build_daily_card_md(date_str, venue, picks),
+                       file_name=f"hkjc_{date_str}_{venue}_daily_plan.md",
+                       mime="text/markdown")
+
+
+# ----------------------------------------------------------------------
 # Overview (cold, 60 s only)
 # ----------------------------------------------------------------------
 def render_overview(date_str, venue):
@@ -737,7 +944,11 @@ with st.sidebar:
     # Race-day default: TODAY (not tomorrow) - the terminal is for the live card.
     date_str = st.text_input("Race day (YYYY-MM-DD)",
                              value=today.strftime("%Y-%m-%d"))
-    venue = st.selectbox("Venue", ["ST", "HV"], index=0)
+    # Venue default follows the HKJC fixture convention: Wed night = Happy
+    # Valley, Sun/Sat day = Sha Tin. Override anytime via the dropdown.
+    default_venue = "HV" if today.weekday() == 2 else "ST"
+    venue = st.selectbox("Venue", ["ST", "HV"],
+                         index=0 if default_venue == "ST" else 1)
     poll_s = st.select_slider("Active race poll (s)", options=[1, 2], value=1)
     auto = st.checkbox("Auto-refresh", value=True)
     force = st.button("🔄 Poll Now", type="primary", use_container_width=True)
@@ -746,16 +957,23 @@ with st.sidebar:
     st.caption("Law 2: real snapshots only · ⏳ when a card is unformed (whole field ≤ 1.01).")
     st.caption(f"Snapshots: data/odds_snapshots/{date_str.replace('-', '')}_{venue}.csv")
 
-options = ["📊 Overview"] + [f"R{i}" for i in range(1, 13)]
+options = ["🎯 Today's Card", "📊 Overview"] + [f"R{i}" for i in range(1, 13)]
 mode = st.radio("View", options, horizontal=True, label_visibility="collapsed", key="qt_view")
 
 if auto:
     try:
         from streamlit_autorefresh import st_autorefresh
-        interval = 60_000 if mode == "📊 Overview" else int(poll_s * 1000)
+        interval = 60_000 if mode in ("🎯 Today's Card", "📊 Overview") else int(poll_s * 1000)
         st_autorefresh(interval=interval, key="qt_auto")
     except Exception:
         pass
+
+if mode == "🎯 Today's Card":
+    st.session_state['qt_active_race'] = None
+    header_panel(date_str, venue, None, None,
+                 '<span style="color:#4dabf7;">🎯 DAILY PLAN · COLD · 60s</span>')
+    render_card(date_str, venue)
+    st.stop()
 
 if mode == "📊 Overview":
     st.session_state['qt_active_race'] = None
