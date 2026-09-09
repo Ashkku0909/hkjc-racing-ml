@@ -863,23 +863,24 @@ def render_card(date_str: str, venue: str):
 # ----------------------------------------------------------------------
 # Overview (cold, 60 s only)
 # ----------------------------------------------------------------------
-def render_overview(date_str, venue):
-    """Cold summary: reads the PERSISTED snapshot store (real data, zero
-    scraping) so it never competes with the active race loop (Law 1)."""
+def _overview_records(date_str, venue):
+    """Shared cold overview computation (zero scraping, Law 1).
+
+    Returns one dict per race on the card (runners, overround, steam/prime
+    counts, best EV, model top-4, top overlay value) or None when the store
+    has no snapshots for the meeting yet."""
     store = snap_store(date_str, venue)
     if len(store) == 0 or 'race_id' not in store.columns:
-        st.info("No snapshots yet — pick a race tab to start polling.")
-        return
+        return None
     nos = []
     for rid in store['race_id'].dropna().unique():
         m = re.match(rf"{re.escape(date_str)}_Race(\d+)$", str(rid))
         if m:
             nos.append(int(m.group(1)))
     if not nos:
-        st.info("No snapshots yet — pick a race tab to start polling.")
-        return
+        return None
     n = max(nos)
-    rows = []
+    recs = []
     for rn in range(1, n + 1):
         sub = store[store['race_id'] == f"{date_str}_Race{rn}"]
         if len(sub) == 0:
@@ -900,7 +901,6 @@ def render_overview(date_str, venue):
         closed_flag = bool(sc.get('race_closed', pd.Series([False])).iloc[0]) \
             if len(sc) and 'race_closed' in sc.columns else False
         thin = closed_flag or (n_valid < 8) or pd.isna(overrun) or (overrun < 15.0)
-        # signal counts: steamers + primes across BOTH win and place pools
         primes = int(sum(1 for _, rr in valid.iterrows() if verdict_of(rr)[0] == 'prime'))
         # BEST EV across win & place (ratio form)
         cands = []
@@ -911,51 +911,101 @@ def render_overview(date_str, venue):
                 cands.append((float(evr) + 1.0, 'W', rr))
             if pev is not None:
                 cands.append((float(pev), 'P', rr))
+        best_pool = best_val = best_horse = None
         if cands and not thin:
             best_val, best_pool, best_row = max(cands, key=lambda c: c[0])
-            best_txt = f"{best_pool} ×{best_val:.3f}"
-            top_txt = (f"{horse_label(best_row)} "
-                       f'<span style="color:#6b7a99;">{best_pool}×{best_val:.2f}</span>')
-        elif thin:
-            best_txt = '<span style="color:#9E9E9E;">N/A ⏳</span>'
-            top_txt = '—'
-        else:
-            best_txt = '—'
-            top_txt = '—'
-        # TOP 4 QUANT SELECTIONS: model rank order, saddlecloth law applied
+            best_horse = horse_label(best_row, html=False)
         t4 = valid.dropna(subset=['prob']).nlargest(4, 'prob')
-        if len(t4):
-            rk = ['1st', '2nd', '3rd', '4th']
-            cls = ['qt-r1', 'qt-r2', 'qt-r3', 'qt-r4']
-            parts = [f'<span class="{cls[i]}">{rk[i]}: {horse_label(t4.iloc[i])}</span>'
-                     for i in range(len(t4))]
-            top4_txt = ' <span style="color:#44506a;">&gt;</span> '.join(parts)
-        else:
-            top4_txt = '—'
-        rows.append((rn, (n_valid, n_pre), overrun, best_txt,
-                     (int((sm >= 75).sum()), primes), top4_txt, top_txt, thin, closed_flag))
+        top4 = [horse_label(t4.iloc[i], html=False) for i in range(len(t4))]
+        recs.append(dict(rn=rn, n_valid=n_valid, n_pre=n_pre, overrun=overrun,
+                         steam=int((sm >= 75).sum()), primes=primes,
+                         best_pool=best_pool, best_val=best_val,
+                         best_horse=best_horse, top4=top4,
+                         thin=thin, closed=closed_flag))
+    return recs
 
+
+def build_overview_md(date_str, venue, recs=None) -> str:
+    """Professional Markdown of the whole meeting overview (downloadable)."""
+    if recs is None:
+        recs = _overview_records(date_str, venue) or []
+    vn = {'ST': 'Sha Tin', 'HV': 'Happy Valley'}.get(str(venue).upper(), str(venue))
+    now = hkt_now()
+    L = [f"# HKJC Meeting Overview — {date_str} {vn}", ""]
+    L.append(f"- **Generated**: {now:%Y-%m-%d %H:%M:%S} HKT")
+    L.append("- Signals = steamers (S ≥ 75) / prime plays · "
+             "Thin = <8 runners or overround <15% (no staking).")
+    L.append("")
+    if not recs:
+        L.append("No snapshots yet — pick race tabs to poll.")
+    else:
+        L.append("| Race | Runners | Overrd. | Best EV | Steam/Prime | Top 4 Model | Top Value |")
+        L.append("|---|---|---|---|---|---|---|")
+        for r in recs:
+            over_txt = f"{r['overrun']:+.1f}%" if not pd.isna(r['overrun']) else "—"
+            runners = f"{r['n_valid']}" + (f" (+{r['n_pre']} ⏳)" if r['n_pre'] else "")
+            if r['thin'] or r['closed']:
+                best = "N/A ⏳" if not r['closed'] else "—"
+                topv = "—"
+            else:
+                best = f"{r['best_pool']} ×{r['best_val']:.3f}" if r['best_val'] is not None else "—"
+                topv = f"{r['best_horse']} ({r['best_pool']}×{r['best_val']:.2f})" if r['best_val'] is not None else "—"
+            tag = "🏁" if r['closed'] else ("⏳ LIQ" if r['thin'] else "")
+            t4 = " > ".join(r['top4']) if r['top4'] else "—"
+            L.append(f"| R{r['rn']} {tag} | {runners} | {over_txt} | {best} | "
+                     f"{r['steam']} / {r['primes']} | {t4} | {topv} |")
+    L.append("")
+    L.append("---")
+    L.append("Generated by HKJC Quant Terminal — educational use only.")
+    return "\n".join(L)
+
+
+def render_overview(date_str, venue):
+    """Cold summary (zero scraping): per-race card + downloadable overview."""
+    recs = _overview_records(date_str, venue)
+    if not recs:
+        st.info("No snapshots yet — pick a race tab to start polling.")
+        return
     hdr = "".join(f'<span>{c}</span>' for c in
                   ["RACE", "RUNNERS", "OVERRD.", "BEST EV", "SIGNALS",
                    "TOP 4 QUANT SELECTIONS", "TOP VALUE (OVERLAY)"])
     st.markdown(f'<div class="qt-ov-hdr qt-term">{hdr}</div>', unsafe_allow_html=True)
-    for rn, (act, pre), overrun, best_txt, (steam, prime), top4_txt, top_txt, thin, closed_flag in rows:
-        if pd.isna(overrun):
+    for r in recs:
+        if pd.isna(r['overrun']):
             over_txt = '<span>—</span>'
         else:
-            over_txt = f'<span>{overrun:+.1f}%</span>'
-        liq = ('<span class="qt-lq"> 🏁</span>' if closed_flag
-               else ('<span class="qt-lq"> ⏳ LIQ</span>' if thin else ''))
-        runner_txt = f'<span>{act}</span>' + (f'<span style="color:#6b7a99;"> {pre} ⏳</span>' if pre else '')
+            over_txt = f'<span>{r["overrun"]:+.1f}%</span>'
+        liq = ('<span class="qt-lq"> 🏁</span>' if r['closed']
+               else ('<span class="qt-lq"> ⏳ LIQ</span>' if r['thin'] else ''))
+        runner_txt = f'<span>{r["n_valid"]}</span>' + \
+            (f'<span style="color:#6b7a99;"> {r["n_pre"]} ⏳</span>' if r['n_pre'] else '')
+        if r['thin'] or r['closed']:
+            best_txt = '<span style="color:#9E9E9E;">N/A ⏳</span>' if not r['closed'] else '<span>—</span>'
+            top_txt = '—'
+        elif r['best_val'] is not None:
+            best_txt = f'<span>{r["best_pool"]} ×{r["best_val"]:.3f}</span>'
+            top_txt = (f'{esc(r["best_horse"])} '
+                       f'<span style="color:#6b7a99;">{r["best_pool"]}×{r["best_val"]:.2f}</span>')
+        else:
+            best_txt, top_txt = '<span>—</span>', '—'
+        cls = ['qt-r1', 'qt-r2', 'qt-r3', 'qt-r4']
+        rk = ['1st', '2nd', '3rd', '4th']
+        parts = [f'<span class="{cls[i]}">{rk[i]}: {esc(r["top4"][i])}</span>'
+                 for i in range(len(r['top4']))]
+        top4_txt = ' <span style="color:#44506a;">&gt;</span> '.join(parts) if parts else '—'
         st.markdown(
             f'<div class="qt-ov-row qt-term">'
-            f'<span style="font-weight:700;">R{rn}</span>{liq}'
+            f'<span style="font-weight:700;">R{r["rn"]}</span>{liq}'
             + runner_txt + over_txt
             + f'<span>{best_txt}</span>'
-            + f'<span>{steam} / {prime}</span>'
+            + f'<span>{r["steam"]} / {r["primes"]}</span>'
             + f'<span class="qt-ov-top4">{top4_txt}</span>'
             + f'<span style="color:{PRIME_COLOR};">{top_txt}</span>'
             + '</div>', unsafe_allow_html=True)
+    st.download_button("📄 Download Overview (.md)",
+                       data=build_overview_md(date_str, venue, recs),
+                       file_name=f"hkjc_{date_str}_{venue}_overview.md",
+                       mime="text/markdown")
 
 
 # ----------------------------------------------------------------------
