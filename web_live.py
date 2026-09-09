@@ -8,7 +8,9 @@ REAL DATA ONLY: polls bet.hkjc.com wp pages; every poll is persisted to
 data/odds_snapshots via scraping.live_scraper.
 """
 import asyncio
+import csv
 import math
+import os
 import re
 import threading
 import time
@@ -116,6 +118,12 @@ _data_loaded: bool = False
 # --- live-validation audit trail (Master-Rule observation, printed once) ---
 _engine_state_prev: dict = {}     # race_id -> last printed execution state
 _steam_seen: set = set()          # (race_id, sorted steamer names) seen
+_audit_done: set = set()          # (race_id, milestone) already persisted
+_audit_lock = threading.Lock()
+AUDIT_COLUMNS = ['timestamp', 'epoch', 'race_id', 'milestone', 'state',
+                 't_tilde', 'w_fuse', 'horse_number', 'horse_name',
+                 'win_odds', 'place_odds', 'smart', 'prob', 'ev',
+                 'place_ev', 'flow_signal', 'flags']
 
 
 def ensure_data_loaded() -> None:
@@ -404,7 +412,8 @@ def _apply_pace_adjustment(probs: pd.Series, runner_df) -> tuple:
     # positive drift applied to closers/backmarkers.
     if n_lead >= 3:
         scenario = 'MELTDOWN'
-        adj = np.where(leaders, -0.15, np.where(closers, 0.10, 0.0))
+        # Master Rules v2.0: backmarkers/closers +0.10, contested leaders -0.15
+        adj = np.where(leaders, -0.15, np.where(backmarkers, 0.10, 0.0))
         if np.any(adj[valid]):
             pv = np.clip(p, 1e-12, 1.0)
             logit = np.log(pv / (1.0 - pv)) + adj
@@ -602,14 +611,14 @@ def bayesian_fusion(p_model: np.ndarray, p_market: np.ndarray, w: float,
 
 def _odds_velocity(sub: pd.DataFrame, window_s: float = FLOW_WINDOW_S) -> dict:
     """horse_number -> {'v90': raw rel. odds change over the window,
-                         'logit_vel': logit(odds) velocity, 'wp_contract': bool}.
+                         'logit_vel': logit(net-odds) velocity, 'wp_contract': bool}.
 
-    Microstructure is measured in LOG-ODDS space (Master Rule 1): the implied
-    logit move dlogit(O) = ln(O_now / O_base) is scale-free, so a steam on a
-    3.0 favourite and one on a 60.0 longshot are comparable (raw % changes
-    would otherwise carry odds-band scale bias). A sharp drop
-    (logit_vel <= FLOW_STEAM_LOGIT, i.e. <= -15% price) with a contracting
-    O_W/O_P ratio is an active syndicate steam.
+    Microstructure velocity uses the NET-odds logit (Master Rules v2.0):
+        dlogit(O) = ln(O_now - 1) - ln(O_base - 1)
+    which is scale-free and exact for pari-mutuel returns (a -15% price on a
+    3.0 favourite and a 60.0 longshot are comparable). Steam trigger:
+    dlogit(O) <= ln(0.85) ~ -0.163 within the window WITH W/P ratio compression.
+    Runners priced at or below 1.0 carry no net-odds logit -> no steam signal.
     """
     out: dict = {}
     try:
@@ -648,7 +657,9 @@ def _odds_velocity(sub: pd.DataFrame, window_s: float = FLOW_WINDOW_S) -> dict:
             if pd.isna(bw) or bw <= 0:
                 continue
             v90 = (float(ow) - float(bw)) / float(bw)
-            logit_vel = float(math.log(float(ow) / float(bw)))
+            logit_vel = None
+            if float(ow) > 1.0 and float(bw) > 1.0:
+                logit_vel = float(math.log((float(ow) - 1.0) / (float(bw) - 1.0)))
             wp_contract = False
             if pd.notna(op) and pd.notna(bp) and op > 0 and bp > 0:
                 wp_contract = (float(ow) / float(op)) < (float(bw) / float(bp))
@@ -678,18 +689,11 @@ def _henery_rank(p: np.ndarray, r: int, gamma: float = HENERY_GAMMA) -> np.ndarr
     g = np.power(np.clip(p, 1e-12, 1.0), gamma)
     res = np.zeros(n)
     if r == 2:
-        for j in range(n):
-            s = 0.0
-            for i in range(n):
-                if i != j:
-                    s_i = g[i]
-                    den = 0.0
-                    for k in range(n):
-                        if k != i:
-                            den += g[k]
-                    if den > 1e-12:
-                        s += p[i] * (g[j] / den)
-            res[j] = s
+        # vectorized: res[j] = sum_{i != j} p[i] * g[j] / (S - g[i])
+        den_i = np.maximum(g.sum() - g, 1e-12)
+        term = np.outer(p, g) / den_i[:, None]
+        np.fill_diagonal(term, 0.0)
+        res = term.sum(axis=0)
     elif r == 3:
         for k in range(n):
             s = 0.0
@@ -828,6 +832,64 @@ def _last3_form() -> dict:
             fm = {}
         _form_cache = fm
     return _form_cache
+
+
+def _audit_milestone(race_id: str, date_str: str, venue: str, race_no: int,
+                     milestone: str, exec_state: str,
+                     t_tilde: Optional[float], w_fuse: float,
+                     scored: pd.DataFrame) -> None:
+    """One-shot persistence of a milestone frame to data/engine_audit_<day>.csv.
+
+    Milestones (T-5m / T-2m / CLOSED-final) give the post-race walk-forward
+    audit exactly what the model saw at each decision point (Master Rules v2.0,
+    Audit Trails). Each (race, milestone) is written once, per horse."""
+    try:
+        day = str(date_str).replace('-', '')
+        path = os.path.join("data", f"engine_audit_{day}.csv")
+        with _audit_lock:
+            key = (race_id, milestone)
+            if key in _audit_done:
+                return
+            now_e = time.time()
+            rows = []
+            for _, r in scored.iterrows():
+                if bool(r.get('unposted')) or pd.isna(r.get('win_odds')):
+                    continue
+                flags = [f for f in ('syndicate_steam', 'divergence_trap',
+                                     'smart_place_absorption') if bool(r.get(f))]
+                rows.append({
+                    'timestamp': datetime.now().isoformat(timespec='seconds'),
+                    'epoch': round(now_e, 3),
+                    'race_id': race_id,
+                    'milestone': milestone,
+                    'state': exec_state,
+                    't_tilde': round(float(t_tilde), 1) if t_tilde is not None else None,
+                    'w_fuse': round(float(w_fuse), 4),
+                    'horse_number': r.get('horse_number'),
+                    'horse_name': r.get('horse_name'),
+                    'win_odds': r.get('win_odds'),
+                    'place_odds': r.get('place_odds'),
+                    'smart': r.get('smart_money_score'),
+                    'prob': r.get('prob'),
+                    'ev': r.get('ev'),
+                    'place_ev': r.get('place_ev'),
+                    'flow_signal': r.get('flow_signal'),
+                    'flags': '|'.join(flags),
+                })
+            if not rows:
+                return
+            is_new = not os.path.exists(path)
+            with open(path, 'a', newline='', encoding='utf-8') as f:
+                w = csv.DictWriter(f, fieldnames=AUDIT_COLUMNS, extrasaction='ignore')
+                if is_new:
+                    w.writeheader()
+                for row in rows:
+                    w.writerow({c: row.get(c) for c in AUDIT_COLUMNS})
+            _audit_done.add(key)
+            print(f"[engine-audit] {race_id} milestone '{milestone}' saved "
+                  f"({len(rows)} runners, state={exec_state}, w={w_fuse:.3f})")
+    except Exception as e:
+        print(f"engine audit persist failed ({race_id} {milestone}): {e}")
 
 
 def score_race(live_df, date_str: str, venue: str, race_no: int):
@@ -1017,9 +1079,10 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
         v = vel.get(hn)
         if not v:
             continue
-        # logit(odds) velocity: scale-free microstructure (Master Rule 1)
+        # net-odds logit velocity (Master Rules v2.0): no price <= 1.0 signal
         lv = v.get('logit_vel')
-        lv = float(lv) if lv is not None else float(v.get('v90'))
+        if lv is None:
+            continue
         if lv <= FLOW_STEAM_LOGIT and bool(v.get('wp_contract')):
             base_ref = float(v.get('v90')) if v.get('v90') is not None else lv
             strength = min(abs(base_ref) / abs(FLOW_STEAM_V), 1.0)
@@ -1145,6 +1208,22 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
     out['tick_delta_place'] = np.where(prev_p.notna() & place.notna(), place - prev_p, np.nan)
     out['polls_n'] = polls_n
     out['open_age_min'] = open_age_min
+
+    # --- milestone audit persistence (T-5m / T-2m / OFFICIAL_CLOSED) ---
+    try:
+        if _post is not None:
+            s_post = (_post - datetime.now(timezone(timedelta(hours=8)))).total_seconds()
+            if s_post <= 300.0:
+                _audit_milestone(race_id, date_str, venue, race_no, 'T-5m',
+                                 exec_state, t_tilde, w_fuse, out)
+            if s_post <= 120.0:
+                _audit_milestone(race_id, date_str, venue, race_no, 'T-2m',
+                                 exec_state, t_tilde, w_fuse, out)
+            if exec_state == 'OFFICIAL_CLOSED':
+                _audit_milestone(race_id, date_str, venue, race_no, 'CLOSED',
+                                 exec_state, t_tilde, w_fuse, out)
+    except Exception as e:
+        print(f"milestone audit failed ({race_id}): {e}")
     return out
 
 
