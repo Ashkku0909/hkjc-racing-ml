@@ -19,8 +19,11 @@ Master-spec implementation:
 """
 import sys
 import os
-import time
+import io
 import re
+import time
+import base64
+import zipfile
 import html as htmlmod
 from datetime import datetime, timedelta, timezone
 
@@ -40,7 +43,7 @@ from web_live import (
     de_vig_market_probs, race_post_time, snap_store, SLOW_TTL,
     effective_poll_ttl, race_meta, MAX_RACES, DISCOVER_TTL,
 )
-from scraping.live_scraper import _extras_cache
+from scraping.live_scraper import _extras_cache, scrape_speedpro
 
 HKT = timezone(timedelta(hours=8))
 PRIME_COLOR = "#FFD700"
@@ -506,12 +509,131 @@ def render_focus(scored, race_no):
     venue = str(scored.iloc[0].get('venue')) if len(scored) else ''
     if date_str and venue:
         report = build_llm_report(scored, date_str, venue, race_no)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button(
+                "📄 Download LLM Report (.md)",
+                data=report,
+                file_name=f"hkjc_{date_str}_{venue}_Race{race_no}.md",
+                mime="text/markdown",
+            )
+        with c2:
+            _speedpro_download_ui(date_str, venue, race_no)
+
+
+def _speedpro_images(date_str: str, venue: str, race_no: int) -> list:
+    """Cached SpeedPRO chart images (list of base64 data URIs) for a race."""
+    try:
+        extras = _extras_cache.get((date_str, venue, int(race_no))) or {}
+        return extras.get('speedpro_images') or []
+    except Exception:
+        return []
+
+
+def _speedpro_fetch_once(date_str: str, venue: str, race_no: int) -> None:
+    """On-demand SpeedPRO scrape (once per race, cached): needed because the
+    Today's Card light-poll skips SpeedPRO; images are only wanted once and
+    never refresh, so fetch them lazily when the user asks."""
+    try:
+        key = (date_str, venue, int(race_no))
+        if _speedpro_images(date_str, venue, race_no):
+            return
+        res = web_live.run_async(scrape_speedpro(int(race_no))).result(timeout=45.0)
+        if not res:
+            return
+        data, images = res if isinstance(res, tuple) else ({}, [])
+        ext = _extras_cache.get(key) or {
+            'speedpro_energy': {}, 'formguide_remarks': {},
+            'draw_win_pct': {}, 'draw_place_pct': {},
+            'wpq_str': '', 'speedpro_images': [],
+        }
+        if images:
+            ext['speedpro_images'] = images
+        if data and not ext.get('speedpro_energy'):
+            ext['speedpro_energy'] = data
+        _extras_cache[key] = ext
+        print(f"[engine-audit] SpeedPRO chart fetched on demand for {venue} "
+              f"R{race_no}: {len(images)} image(s)")
+    except Exception as e:
+        print(f"SpeedPRO on-demand fetch failed ({venue} R{race_no}): {e}")
+
+
+def _png_bytes(data_uri: str):
+    """Decode a base64 data-URI (data:image/...;base64,...) to PNG bytes."""
+    try:
+        if isinstance(data_uri, str) and ',' in data_uri:
+            return base64.b64decode(data_uri.split(',', 1)[1])
+    except Exception:
+        return None
+    return None
+
+
+def _speedpro_download_ui(date_str: str, venue: str, race_no: int):
+    """Chart download, lazily fetched on first click.
+
+    Single chart -> direct .png download (no zip); several charts -> .zip."""
+    key = (date_str, venue, int(race_no))
+    imgs = _speedpro_images(date_str, venue, race_no)
+    if not imgs:
+        if st.button("🖼️ Fetch SpeedPRO Chart", key=f"fetch_sp_{date_str}_{venue}_{race_no}",
+                     help="Scraped once on click and cached - charts never refresh."):
+            _speedpro_fetch_once(date_str, venue, race_no)
+            st.rerun()
+        st.caption("🖼️ SpeedPRO chart fetched only when clicked")
+        return
+    if len(imgs) == 1:
+        data = _png_bytes(imgs[0])
+        if data:
+            st.download_button(
+                "🖼️ Download SpeedPRO Chart (.png)",
+                data=data,
+                file_name=f"hkjc_{date_str}_{venue}_Race{race_no}_speedpro.png",
+                mime="image/png",
+            )
+            return
+    zdata = speedpro_chart_zip(date_str, venue, race_no)
+    if zdata is not None:
         st.download_button(
-            "📄 Download LLM Report (.md)",
-            data=report,
-            file_name=f"hkjc_{date_str}_{venue}_Race{race_no}.md",
-            mime="text/markdown",
+            "🖼️ Download SpeedPRO Charts (.zip)",
+            data=zdata,
+            file_name=f"hkjc_{date_str}_{venue}_Race{race_no}_speedpro.zip",
+            mime="application/zip",
         )
+    else:
+        st.caption("🖼️ SpeedPRO charts unavailable for this race")
+
+
+def speedpro_chart_zip(date_str: str, venue: str, race_no: int):
+    """Packs multiple SpeedPRO chart images (base64 data URIs) into a .zip.
+
+    Images live in scraping.live_scraper._extras_cache (captured once per race
+    by the full scrape / on-demand fetch). Returns raw zip bytes or None."""
+    try:
+        extras = _extras_cache.get((date_str, venue, int(race_no))) or {}
+        imgs = extras.get('speedpro_images') or []
+        if not imgs:
+            return None
+        buf = io.BytesIO()
+        written = 0
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+            for i, src in enumerate(imgs, 1):
+                if not isinstance(src, str) or ',' not in src:
+                    continue
+                payload = src.split(',', 1)[1]
+                try:
+                    data = base64.b64decode(payload)
+                except Exception:
+                    continue
+                if not data:
+                    continue
+                z.writestr(f"speedpro_R{int(race_no)}_{i}.png", data)
+                written += 1
+        if written == 0:
+            return None
+        return buf.getvalue()
+    except Exception as e:
+        print(f"speedpro chart zip failed ({venue} R{race_no}): {e}")
+        return None
 
 
 def build_llm_report(scored, date_str, venue, race_no) -> str:
