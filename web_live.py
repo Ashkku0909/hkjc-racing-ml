@@ -113,6 +113,9 @@ _snap_cache: dict = {}
 _card_cache: dict = {}
 _inflight: dict = {}     # (date, venue, race) -> (ts, Future)  single-flight guard
 _data_loaded: bool = False
+# --- live-validation audit trail (Master-Rule observation, printed once) ---
+_engine_state_prev: dict = {}     # race_id -> last printed execution state
+_steam_seen: set = set()          # (race_id, sorted steamer names) seen
 
 
 def ensure_data_loaded() -> None:
@@ -391,6 +394,8 @@ def _apply_pace_adjustment(probs: pd.Series, runner_df) -> tuple:
     styles = runner_df['horse_name'].astype(str).map(style_of)
     leaders = (styles == 'Leader').to_numpy(dtype=bool)
     closers = (styles == 'Closer').to_numpy(dtype=bool)
+    backmarkers = (styles.isin(['Closer', 'Backmarker'])).to_numpy(dtype=bool)
+    front = (styles.isin(['Leader', 'Presser'])).to_numpy(dtype=bool)
     n_lead = int(leaders.sum())
     p = pd.to_numeric(probs, errors='coerce').to_numpy(dtype=float)
     valid = np.isfinite(p)
@@ -417,6 +422,29 @@ def _apply_pace_adjustment(probs: pd.Series, runner_df) -> tuple:
             p[~valid] = np.nan
             if np.nansum(p) > 0:
                 p = p / np.nansum(p)
+    elif n_lead == 0:
+        # Slow pace / zero pace-setters: on the narrow Happy Valley course a
+        # hold-up runner parked wide is nearly a death sentence, while an
+        # inside gate (<=4) front-runner/presser can steal a slow race.
+        scenario = 'SLOW'
+        is_hv = False
+        if 'venue' in runner_df.columns and len(runner_df):
+            try:
+                is_hv = str(pd.Series(runner_df['venue']).iloc[0]).upper() == 'HV'
+            except Exception:
+                is_hv = False
+        draw = pd.to_numeric(runner_df.get('barrier_draw'), errors='coerce')
+        if is_hv:
+            dv = draw.to_numpy(dtype=float)
+            adj = np.where(backmarkers & (dv >= 8.0), -0.15, 0.0)          # wide closer
+            adj = np.where(front & (dv >= 1.0) & (dv <= 4.0), adj + 0.10, adj)  # rail front
+            if np.any(adj[valid]):
+                pv = np.clip(p, 1e-12, 1.0)
+                logit = np.log(pv / (1.0 - pv)) + adj
+                p = 1.0 / (1.0 + np.exp(-logit))
+                p[~valid] = np.nan
+                if np.nansum(p) > 0:
+                    p = p / np.nansum(p)
     return pd.Series(p, index=probs.index), (scenario, n_lead)
 
 
@@ -895,6 +923,12 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
     race_closed = (exec_state == "OFFICIAL_CLOSED")
     t_tilde = t_tilde_seconds(_post)
     w_fuse = fusion_weight(_post, exec_state)
+    # audit: print once per execution-state transition (TURBO / LOADING / CLOSED)
+    if exec_state in ('TURBO_APPROACH', 'LOADING_DELAY', 'OFFICIAL_CLOSED') \
+            and _engine_state_prev.get(race_id) != exec_state:
+        print(f"[engine-audit] {race_id} state -> {exec_state}  "
+              f"w={w_fuse:.3f}  T~={round(t_tilde, 0) if t_tilde is not None else None}s")
+        _engine_state_prev[race_id] = exec_state
 
     # --- Excise invalid runners BEFORE softmax / smart money / Kelly ---
     valid = _valid_odds_mask(merged['win_odds'], merged.get('place_odds'))
@@ -1000,6 +1034,18 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
         delta_flow = np.where(trap, delta_flow + TRAP_LOGIT_PENALTY, delta_flow)
     fused = bayesian_fusion(pm, pk, w_fuse, delta_flow)
     work['delta_flow'] = delta_flow
+    # audit: print once per distinct syndicate-steam episode (logit-velocity)
+    try:
+        if (work['syndicate_steam']).any():
+            steamers = tuple(sorted(work.loc[work['syndicate_steam'], 'horse_name']
+                                    .astype(str).tolist()))
+            key = (race_id, steamers)
+            if key not in _steam_seen:
+                print(f"[engine-audit] STEAM {race_id}: {list(steamers)}  "
+                      f"logit_vel<={FLOW_STEAM_LOGIT:.3f} (≤-15% price / 90s)")
+                _steam_seen.add(key)
+    except Exception:
+        pass
     work['live_prob'] = fused
     work['fused_weight'] = w_fuse
     work['exec_state'] = exec_state

@@ -136,6 +136,7 @@ st.markdown("""
 .qt-pace.meltdown { background:#3a1010; color:#FF5252; border:1px solid rgba(255,82,82,.5); }
 .qt-pace.lone { background:#0f2a1a; color:#00E676; border:1px solid rgba(0,230,118,.4); }
 .qt-pace.normal { background:#141c2e; color:#9E9E9E; }
+.qt-pace.slow { background:#2a1f0a; color:#FFB300; border:1px solid rgba(255,179,0,.5); }
 .qt-gate {
   display:inline-block; padding:3px 12px; border-radius:4px; font-size:11px;
   font-weight:700; margin:2px 6px 10px 0; background:#33260a; color:#FFB300;
@@ -395,6 +396,10 @@ def render_focus(scored, race_no):
         elif pace_scn == 'LONE':
             st.markdown('<span class="qt-pace lone qt-term">🚀 LONE LEADER (slow bias) '
                         '— leader logit +0.20</span>', unsafe_allow_html=True)
+        elif pace_scn == 'SLOW':
+            st.markdown('<span class="qt-pace slow qt-term">🐢 SLOW PACE (0 leaders) '
+                        '— HV wide-draw closers −0.15 logit · inside front-runners +0.10</span>',
+                        unsafe_allow_html=True)
         else:
             st.markdown('<span class="qt-pace normal qt-term">⚖️ NORMAL PACE '
                         f'({pace_n:.0f} leaders)</span>', unsafe_allow_html=True)
