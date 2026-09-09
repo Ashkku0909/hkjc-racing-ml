@@ -8,6 +8,7 @@ REAL DATA ONLY: polls bet.hkjc.com wp pages; every poll is persisted to
 data/odds_snapshots via scraping.live_scraper.
 """
 import asyncio
+import math
 import re
 import threading
 import time
@@ -60,12 +61,16 @@ TURBO_LEAD_S = 90.0          # TURBO_APPROACH starts 90s before nominal post
 TURBO_TTL_S = 0.8            # throttled polling cadence inside the final window
 T_TILDE_MIN = 20.0           # effective time-to-jump floor (never decays to 0)
 T_TILDE_MAX = 45.0           # effective time-to-jump cap in the final band
-W_TILDE_EARLY = 0.25         # T~ > 15m   -> model dominates
-W_TILDE_MID = 0.50           # 5m < T~ <= 15m
-W_TILDE_LATE = 0.70          # 1m < T~ <= 5m
-W_TILDE_TURBO = 0.85         # T~ <= 1m / TURBO_APPROACH / LOADING_DELAY (pinned)
-FLOW_WINDOW_S = 90.0         # relative odds-velocity lookback window
-FLOW_STEAM_V = -0.15         # -15% win-price over the window = syndicate steam
+W_TILDE_EARLY = 0.25         # asymptote far from post (model-dominated)
+W_TILDE_TURBO = 0.85         # asymptote at post (market-dominated, pinned in TURBO)
+# Smooth continuous Bayesian post-time weight:
+#   w(T~) = w_max - (w_max - w_min) / (1 + exp(-kappa * (T~ - T0)))
+#   w_max = 0.85 (market), w_min = 0.25 (model), T0 = 360s, kappa = 0.02.
+W_TILDE_T0 = 360.0
+W_TILDE_KAPPA = 0.02
+FLOW_WINDOW_S = 90.0         # relative-velocity lookback window
+FLOW_STEAM_V = -0.15         # reference: -15% win price over the window
+FLOW_STEAM_LOGIT = math.log(1.0 + FLOW_STEAM_V)   # -0.1625 in logit(odds) space
 FLOW_DELTA_MIN = 0.10        # logit booster for a detected steam
 FLOW_DELTA_MAX = 0.35
 TRAP_MODEL_MIN = 0.30        # divergence-trap defense (adverse selection)
@@ -374,7 +379,7 @@ def _pace_profiles() -> dict:
 def _apply_pace_adjustment(probs: pd.Series, runner_df) -> tuple:
     """Pace Scenario Matrix (lagged front-runner density, leak-free).
 
-      Pace Meltdown (>= 4 pure Leaders): front-runner logits -0.15, closers +0.10
+      Pace Meltdown (>= 3 Leaders): front-runner logits -0.15, closers +0.10
       Lone Leader / Slow Bias (exactly 1 Leader): leader logit +0.20
     Returns (adjusted probs Series, (scenario, n_leaders)).
     """
@@ -390,7 +395,9 @@ def _apply_pace_adjustment(probs: pd.Series, runner_df) -> tuple:
     p = pd.to_numeric(probs, errors='coerce').to_numpy(dtype=float)
     valid = np.isfinite(p)
     scenario = 'NORMAL'
-    if n_lead >= 4:
+    # Master Rule 2 (pace clashing): N_leaders >= 3 -> front-runners clash,
+    # positive drift applied to closers/backmarkers.
+    if n_lead >= 3:
         scenario = 'MELTDOWN'
         adj = np.where(leaders, -0.15, np.where(closers, 0.10, 0.0))
         if np.any(adj[valid]):
@@ -493,23 +500,23 @@ def execution_state(post_dt, sub: Optional[pd.DataFrame] = None,
 
 
 def fusion_weight(post_dt, state: Optional[str] = None) -> float:
-    """Time-varying market weight w(T~) for the Bayesian blend.
+    """Smooth continuous Bayesian post-time market weight w(T~).
 
-    Pinned at peak sensitivity (0.85) throughout TURBO_APPROACH and
-    LOADING_DELAY so last-second syndicate flows are always absorbed.
+        w(T~) = w_max - (w_max - w_min) / (1 + exp(-kappa * (T~ - T0)))
+        w_max = 0.85, w_min = 0.25, T0 = 360 s, kappa = 0.02
+
+    Pinned at peak (0.85) throughout TURBO_APPROACH and LOADING_DELAY so
+    last-second syndicate flows are always absorbed (Master Rule 1 / 2).
     """
     if state is None:
         state = execution_state(post_dt)
     if state in ("TURBO_APPROACH", "LOADING_DELAY"):
         return W_TILDE_TURBO
     tt = t_tilde_seconds(post_dt)
-    if tt is None or tt > 900.0:
+    if tt is None:
         return W_TILDE_EARLY
-    if tt > 300.0:
-        return W_TILDE_MID
-    if tt > 60.0:
-        return W_TILDE_LATE
-    return W_TILDE_TURBO
+    z = math.exp(-W_TILDE_KAPPA * (tt - W_TILDE_T0))
+    return float(W_TILDE_TURBO - (W_TILDE_TURBO - W_TILDE_EARLY) / (1.0 + z))
 
 
 def effective_poll_ttl(post_dt, base_ttl: float) -> float:
@@ -566,12 +573,15 @@ def bayesian_fusion(p_model: np.ndarray, p_market: np.ndarray, w: float,
 
 
 def _odds_velocity(sub: pd.DataFrame, window_s: float = FLOW_WINDOW_S) -> dict:
-    """horse_number -> {'v90': rel odds change over the window,
-                         'wp_contract': win/place ratio contracted}.
+    """horse_number -> {'v90': raw rel. odds change over the window,
+                         'logit_vel': logit(odds) velocity, 'wp_contract': bool}.
 
-    v90 = (O_now - O_base) / O_base (fraction over ~90s). A sharp drop
-    (<= FLOW_STEAM_V) with a contracting O_W/O_P ratio is an active syndicate
-    steam - the O_W/O_P test filters pure pool noise.
+    Microstructure is measured in LOG-ODDS space (Master Rule 1): the implied
+    logit move dlogit(O) = ln(O_now / O_base) is scale-free, so a steam on a
+    3.0 favourite and one on a 60.0 longshot are comparable (raw % changes
+    would otherwise carry odds-band scale bias). A sharp drop
+    (logit_vel <= FLOW_STEAM_LOGIT, i.e. <= -15% price) with a contracting
+    O_W/O_P ratio is an active syndicate steam.
     """
     out: dict = {}
     try:
@@ -610,10 +620,11 @@ def _odds_velocity(sub: pd.DataFrame, window_s: float = FLOW_WINDOW_S) -> dict:
             if pd.isna(bw) or bw <= 0:
                 continue
             v90 = (float(ow) - float(bw)) / float(bw)
+            logit_vel = float(math.log(float(ow) / float(bw)))
             wp_contract = False
             if pd.notna(op) and pd.notna(bp) and op > 0 and bp > 0:
                 wp_contract = (float(ow) / float(op)) < (float(bw) / float(bp))
-            out[hn] = {'v90': v90, 'wp_contract': wp_contract}
+            out[hn] = {'v90': v90, 'logit_vel': logit_vel, 'wp_contract': wp_contract}
     except Exception as e:
         print(f"odds velocity failed: {e}")
     return out
@@ -970,8 +981,14 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
         except (TypeError, ValueError):
             continue
         v = vel.get(hn)
-        if v and float(v['v90']) <= FLOW_STEAM_V and bool(v['wp_contract']):
-            strength = min(abs(float(v['v90'])) / abs(FLOW_STEAM_V), 1.0)
+        if not v:
+            continue
+        # logit(odds) velocity: scale-free microstructure (Master Rule 1)
+        lv = v.get('logit_vel')
+        lv = float(lv) if lv is not None else float(v.get('v90'))
+        if lv <= FLOW_STEAM_LOGIT and bool(v.get('wp_contract')):
+            base_ref = float(v.get('v90')) if v.get('v90') is not None else lv
+            strength = min(abs(base_ref) / abs(FLOW_STEAM_V), 1.0)
             delta_flow[work.index.get_loc(pos)] = (FLOW_DELTA_MIN
                 + (FLOW_DELTA_MAX - FLOW_DELTA_MIN) * strength)
             work.at[pos, 'syndicate_steam'] = True

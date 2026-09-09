@@ -78,13 +78,17 @@ def test_state_machine_delayed_race():
 
 def test_fusion_weight_pinned_until_freeze():
     post = datetime.now(HKT) + timedelta(hours=2)
+    # far from post -> model-dominated asymptote (w_min = 0.25)
     assert abs(fusion_weight(post, "PRE_POST") - 0.25) < 1e-9
+    # peak sensitivity pinned in the final window / gate delay
     assert abs(fusion_weight(post, "TURBO_APPROACH") - 0.85) < 1e-9
     assert abs(fusion_weight(post, "LOADING_DELAY") - 0.85) < 1e-9
-    assert abs(fusion_weight(post, "OFFICIAL_CLOSED") - 0.25) < 1e-9
-    # late-phase schedule by t-tilde
+    # smooth logistic ramp between the asymptotes (kappa=0.02, T0=360s)
     post_near = datetime.now(HKT) + timedelta(seconds=200)
-    assert abs(fusion_weight(post_near) - 0.70) < 1e-9
+    w200 = fusion_weight(post_near)
+    assert 0.80 < w200 < 0.84            # approaching peak, market dominates
+    post_mid = datetime.now(HKT) + timedelta(seconds=900)
+    assert 0.24 < fusion_weight(post_mid) < 0.45   # smooth mid-ramp, below late-step
 
 
 def test_t_tilde_stretch():
