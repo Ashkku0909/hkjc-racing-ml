@@ -387,3 +387,182 @@ def build_core_satellite_bets(race_df,
 
     return {'qpl_pairs': qpl_pairs, 'pla_bets': pla_bets,
             'bankers': list(zip(bankers['horse_code'], bankers['_tier']))}
+
+
+# ================================================================
+# MASTER-RULES TASK C — Exotics Overlay Pricing Matrix (Q / QP)
+# ================================================================
+# Edge = (P_model / P_market) - 1.0 on QUINELLA and QUINELLA-PLACE pairs.
+# Pair probabilities use HENERY order statistics (gamma in [0.75, 0.88] by
+# field size) applied to BOTH the model and de-vigged market side so the edge
+# is apples-to-apples. Filter: edge >= min_edge AND at least one runner has
+# Smart Money S >= min_smart. Returns the top-N combinations.
+
+
+def henery_quinella_matrix(p, gamma=None):
+    """P(exact quinella (i,j), either order) for every pair, under Henery
+    order statistics: conditional 2nd odds are g_j/(S - g_i), g = p^gamma.
+
+    Vectorised: Q[i,j] = p_i*g_j/(S-g_i) + p_j*g_i/(S-g_j)   (i != j, Q=0 diag)
+    """
+    p = np.asarray(p, dtype=float)
+    n = len(p)
+    if n < 2:
+        return np.zeros((n, n))
+    if gamma is None:
+        gamma = henery_gamma_for_field(n)
+    pv = _normalize(p)
+    g = np.clip(pv, 1e-12, 1.0) ** gamma
+    S = float(g.sum())
+    den = np.maximum(S - g, 1e-12)
+    Q = (pv[:, None] * g[None, :] / den[:, None]
+         + pv[None, :] * g[:, None] / den[None, :])
+    np.fill_diagonal(Q, 0.0)
+    return Q
+
+
+def henery_qp_matrix(p, gamma=None, n_places=3):
+    """P(both horses i and j finish inside the top `n_places`) for EVERY pair,
+    under Henery order statistics (Master Rules Task C: vectorized pairs).
+
+    n_places in (2, 3): HKJC QP pays the first 3 (first 2 in small fields).
+    Implementation is vectorised over runner pairs by enumerating the position
+    of the extra horse x for each fixed x (O(n^3) total, exact chain sums):
+      both-top2 term + {x 1st / x 2nd / x 3rd} chain contributions.
+    """
+    p = np.asarray(p, dtype=float)
+    n = len(p)
+    if n < 2:
+        return np.zeros((n, n))
+    if gamma is None:
+        gamma = henery_gamma_for_field(n)
+    pv = _normalize(p)
+    g = np.clip(pv, 1e-12, 1.0) ** gamma
+    S = float(g.sum())
+    k = int(n_places)
+    if k > n:
+        k = n
+    if k < 2:
+        return np.zeros((n, n))
+    den_i = np.maximum(S - g, 1e-12)
+    # P(both i,j finish in the top 2, either order) = A + A.T.
+    # For top-3, the 'x third' orderings (i,j first two, x third) collapse over
+    # all x != i,j EXACTLY back to A + A.T (sum_x g_x = S - g_i - g_j), so the
+    # per-x loop only needs the x-1st and x-2nd chain contributions.
+    A = pv[:, None] * g[None, :] / den_i[:, None]
+    np.fill_diagonal(A, 0.0)
+    if k == 2:
+        return A + A.T
+    # --- top-3: extra horse x is 1st or 2nd; the x-3rd part collapses to A+A.T
+    QP = np.zeros((n, n))
+    for x in range(n):
+        gx = g[x]
+        s_gx = S - gx
+        # x first, i second, j third   +   x first, j second, i third:
+        #   p_x * g_i/(S-g_x) * g_j/(S-g_x-g_i)  +  mirrored
+        if s_gx > 1e-12:
+            d_x_i = np.maximum(s_gx - g[:, None], 1e-12)   # S - g_x - g_i (row)
+            termA = (pv[x] * g[:, None] / s_gx) * (g[None, :] / d_x_i)
+            x1 = termA + termA.T
+        else:
+            x1 = np.zeros((n, n))
+        # i first, x second, j third   +   j first, x second, i third:
+        #   p_i * g_x/(S-g_i) * g_j/(S-g_i-g_x)  +  mirrored
+        d_i_x = np.maximum(S - g[:, None] - gx, 1e-12)    # S - g_i - g_x (row)
+        termC = (pv[:, None] * gx / den_i[:, None]) * (g[None, :] / d_i_x)
+        x2 = termC + termC.T
+        # mask rows/cols == x (x must differ from both i and j)
+        x1[x, :] = 0.0
+        x1[:, x] = 0.0
+        x2[x, :] = 0.0
+        x2[:, x] = 0.0
+        QP = QP + x1 + x2
+    QP = QP + A + A.T
+    np.fill_diagonal(QP, 0.0)
+    return QP
+
+
+def overlay_pricing_matrix(race_df, prob_col='prob', odds_col='win_odds',
+                           smart_col='smart_money_score', gamma=None,
+                           min_edge=0.25, min_smart=50.0, top_n=5,
+                           n_places=None):
+    """Master-Rules Task C: Quinella / Quinella-Place overlay matrix for a race.
+
+    race_df must contain (per runner):
+        prob_col   model fused win probability (float 0..1)
+        odds_col   live win odds (float > 1)
+        smart_col  Smart Money score S (float; absent -> treated as 50)
+        horse_name (optional) / horse_number (optional) for display
+
+    Edge = (P_model / P_market) - 1.0 computed on Henery Q & QP probabilities
+    (same gamma on both sides). A pair is kept when its best edge >= min_edge
+    AND at least one runner has S >= min_smart; the top `top_n` by best edge
+    are returned (highest edge first).
+
+    Returns a DataFrame (empty when nothing qualifies) with columns:
+      rank, horse_i, horse_j, num_i, num_j, odds_i, odds_j, smart_i, smart_j,
+      q_model_prob, q_market_prob, q_edge, qp_model_prob, qp_market_prob,
+      qp_edge, best_edge
+    """
+    df = race_df.reset_index(drop=True).copy()
+    need = [prob_col, odds_col]
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        raise ValueError(f"overlay_pricing_matrix missing columns: {missing}")
+    pm = pd.to_numeric(df.get(prob_col), errors='coerce')
+    po = pd.to_numeric(df.get(odds_col), errors='coerce')
+    if smart_col in df.columns:
+        sm = pd.to_numeric(df.get(smart_col), errors='coerce').fillna(min_smart)
+    else:
+        sm = pd.Series(min_smart, index=df.index)
+    ok = pm.notna() & (pm > 0) & (pm < 1) & po.notna() & (po > 1.0)
+    df = df[ok].reset_index(drop=True)
+    if len(df) < 2:
+        return pd.DataFrame()
+    p_model = _normalize(df[prob_col].astype(float).values)
+    p_mkt = market_win_probs(df[odds_col].astype(float).values)
+    n = len(df)
+    if gamma is None:
+        gamma = henery_gamma_for_field(n)
+    k = int(n_places) if n_places else (3 if n >= 7 else 2)
+    Qm = henery_quinella_matrix(p_model, gamma)
+    Qk = henery_quinella_matrix(p_mkt, gamma)
+    QPm = henery_qp_matrix(p_model, gamma, k)
+    QPk = henery_qp_matrix(p_mkt, gamma, k)
+
+    def name(i):
+        return (str(df.loc[i, 'horse_name']) if 'horse_name' in df.columns
+                else f"H{i + 1}")
+
+    def num(i):
+        return (df.loc[i, 'horse_number'] if 'horse_number' in df.columns
+                else i + 1)
+
+    rows = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if float(sm.iloc[i]) < min_smart and float(sm.iloc[j]) < min_smart:
+                continue
+            q_edge = (Qm[i, j] / Qk[i, j] - 1.0) if Qk[i, j] > 1e-12 else 0.0
+            qp_edge = (QPm[i, j] / QPk[i, j] - 1.0) if QPk[i, j] > 1e-12 else 0.0
+            best = max(q_edge, qp_edge)
+            if best < min_edge:
+                continue
+            rows.append({
+                'horse_i': name(i), 'horse_j': name(j),
+                'num_i': num(i), 'num_j': num(j),
+                'odds_i': float(df.loc[i, odds_col]),
+                'odds_j': float(df.loc[j, odds_col]),
+                'smart_i': float(sm.iloc[i]), 'smart_j': float(sm.iloc[j]),
+                'q_model_prob': Qm[i, j], 'q_market_prob': Qk[i, j],
+                'q_edge': q_edge,
+                'qp_model_prob': QPm[i, j], 'qp_market_prob': QPk[i, j],
+                'qp_edge': qp_edge,
+                'best_edge': best,
+            })
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    out = out.sort_values('best_edge', ascending=False).head(int(top_n)).reset_index(drop=True)
+    out.insert(0, 'rank', np.arange(1, len(out) + 1))
+    return out

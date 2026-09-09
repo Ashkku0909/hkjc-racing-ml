@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import csv
 import os
 import re
@@ -26,6 +27,68 @@ RACE_META: dict = {}
 # process lifetime. The live odds loop must NOT reload them per poll (that was
 # the main source of 3-8s poll latency and heavy load).
 _extras_cache: dict = {}
+
+# ---------------------------------------------------------------------------
+# SpeedPRO chart disk persistence (Master Rules Task B / §3):
+# charts are decoded to data/speedpro_charts/{date}_{venue}_R{race}.png and
+# linked from the LLM .md report as RELATIVE markdown images - raw base64 is
+# NEVER embedded in report files. Persistence is idempotent (skip existing).
+# ---------------------------------------------------------------------------
+SPEEDPRO_CHART_DIR = os.path.join('data', 'speedpro_charts')
+
+
+def _chart_path(date_str: str, venue: str, race_no: int, index=None) -> str:
+    v = re.sub(r'[^A-Za-z0-9]+', '', str(venue).upper()) or 'RACE'
+    base = f"{date_str}_{v}_R{int(race_no)}"
+    name = base if index is None else f"{base}_{index}"
+    return os.path.join(SPEEDPRO_CHART_DIR, f"{name}.png")
+
+
+def save_speedpro_chart(date_str: str, venue: str, race_no: int,
+                        data_uri, index=None) -> str:
+    """Decode ONE base64 PNG data-URI to disk (idempotent).
+
+    Returns the relative path (e.g. 'data/speedpro_charts/2026-09-09_HV_R3.png')
+    or '' when there is nothing to save."""
+    try:
+        if not data_uri or ',' not in str(data_uri):
+            return ''
+        payload = str(data_uri).split(',', 1)[1]
+        data = base64.b64decode(payload)
+        if not data:
+            return ''
+        os.makedirs(SPEEDPRO_CHART_DIR, exist_ok=True)
+        path = _chart_path(date_str, venue, race_no, index)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+        with open(path, 'wb') as f:
+            f.write(data)
+        return path
+    except Exception as e:
+        print(f"save_speedpro_chart failed ({venue} R{race_no}): {e}")
+        return ''
+
+
+def persist_speedpro_charts(date_str: str, venue: str, race_no: int,
+                            images=None) -> list:
+    """Persist every (already cached) SpeedPRO chart for a race to disk.
+
+    Single chart  -> {date}_{venue}_R{race}.png
+    Several charts -> {date}_{venue}_R{race}_2.png, _3.png, ...
+    Returns the list of relative paths ([] when no charts are cached)."""
+    if images is None:
+        extras = _extras_cache.get((date_str, venue, int(race_no))) or {}
+        images = extras.get('speedpro_images') or []
+    if not images:
+        return []
+    multi = len(images) > 1
+    out = []
+    for i, src in enumerate(images, 1):
+        p = save_speedpro_chart(date_str, venue, int(race_no), src,
+                                index=i if multi else None)
+        if p:
+            out.append(p)
+    return out
 
 # Reusable Playwright pages per race. Creating a new context + page per poll
 # costs ~300-500ms; the odds SPA only needs the SAME page navigated again.
@@ -870,6 +933,13 @@ async def scrape_live_odds(date_str, venue="S1", race_num=1, time_to_post: Optio
                         'speedpro_images': speedpro_images,
                     }
                     _extras_cache[(date_str, venue, int(race_num))] = extras
+                    # Master Rules Task B: decode charts to disk once so the LLM
+                    # .md report can link relative files (never raw base64).
+                    try:
+                        persist_speedpro_charts(date_str, venue, int(race_num),
+                                                speedpro_images)
+                    except Exception as e:
+                        print(f"speedpro persist failed (R{race_num}): {e}")
                 except Exception as e:
                     print(f"Skipping extra sources due to error: {e}")
                     extras = {'speedpro_energy': {}, 'formguide_remarks': {},

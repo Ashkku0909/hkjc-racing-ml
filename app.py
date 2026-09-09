@@ -43,7 +43,8 @@ from web_live import (
     de_vig_market_probs, race_post_time, snap_store, SLOW_TTL,
     effective_poll_ttl, race_meta, MAX_RACES, DISCOVER_TTL,
 )
-from scraping.live_scraper import _extras_cache, scrape_speedpro
+from scraping.live_scraper import _extras_cache, scrape_speedpro, persist_speedpro_charts
+from modeling.exotics_pricing import overlay_pricing_matrix
 
 HKT = timezone(timedelta(hours=8))
 PRIME_COLOR = "#FFD700"
@@ -419,6 +420,38 @@ def render_focus(scored, race_no):
             f'<div class="qt-top4 qt-term">🏆 MODEL ORDER&nbsp;&nbsp;'
             f'{"&nbsp;·&nbsp;".join(parts)}</div>', unsafe_allow_html=True)
 
+    # --- Q/QP exotics overlay matrix (Master Rules Task C) ---
+    # Edge = P_model/P_market - 1 on Henery Q & QP pairs; pairs need edge >= 0.25
+    # AND at least one runner with Smart Money S >= 50. Top 5 shown when open.
+    if not race_closed:
+        try:
+            ov_valid = scored[~scored['unposted']].copy()
+            ov_valid = ov_valid[pd.to_numeric(ov_valid['win_odds'], errors='coerce').notna()
+                                & pd.to_numeric(ov_valid['prob'], errors='coerce').notna()]
+            if len(ov_valid) >= 5:
+                ov = overlay_pricing_matrix(
+                    ov_valid, prob_col='prob', odds_col='win_odds',
+                    smart_col='smart_money_score', min_edge=0.25, min_smart=50.0,
+                    top_n=5)
+                if len(ov):
+                    with st.expander(f"🎯 Q/QP OVERLAY MATRIX — top {len(ov)} pairs "
+                                     "(edge ≥ 25% · S ≥ 50)", expanded=False):
+                        for _, p in ov.iterrows():
+                            tag_q = f"Q ×{p['q_edge'] + 1.0:.2f}" if p['q_edge'] >= 0.25 else ""
+                            tag_qp = f"QP ×{p['qp_edge'] + 1.0:.2f}" if p['qp_edge'] >= 0.25 else ""
+                            tags = ' · '.join(t for t in (tag_q, tag_qp) if t)
+                            st.markdown(
+                                f"<div class='qt-term' style='font-size:0.82rem;'>"
+                                f"<b style='color:#FFD700;'>#{int(p['num_i'])} {esc(str(p['horse_i']))}</b> "
+                                f"(O {p['odds_i']:.1f} · S {p['smart_i']:.0f}) + "
+                                f"<b style='color:#FFD700;'>#{int(p['num_j'])} {esc(str(p['horse_j']))}</b> "
+                                f"(O {p['odds_j']:.1f} · S {p['smart_j']:.0f}) — "
+                                f"<span style='color:#00E676;'>{tags}</span> · "
+                                f"best edge {p['best_edge'] * 100:.0f}%</div>",
+                                unsafe_allow_html=True)
+        except Exception as e:
+            print(f"overlay matrix display failed: {e}")
+
     cols = ["HORSE", "MODEL / DE-VIG MKT", "WIN", "PLACE",
             "SMART FLOW", "JOCKEY / TRAINER", "LAST 3", "VERDICT"]
     hdr = "".join(f'<span>{c}</span>' for c in cols)
@@ -552,6 +585,9 @@ def _speedpro_fetch_once(date_str: str, venue: str, race_no: int) -> None:
         if data and not ext.get('speedpro_energy'):
             ext['speedpro_energy'] = data
         _extras_cache[key] = ext
+        # Master Rules Task B: decode to data/speedpro_charts/*.png so the LLM
+        # .md report can link relative files instead of raw base64.
+        persist_speedpro_charts(date_str, venue, int(race_no), images)
         print(f"[engine-audit] SpeedPRO chart fetched on demand for {venue} "
               f"R{race_no}: {len(images)} image(s)")
     except Exception as e:
@@ -581,6 +617,8 @@ def _speedpro_download_ui(date_str: str, venue: str, race_no: int):
             st.rerun()
         st.caption("🖼️ SpeedPRO chart fetched only when clicked")
         return
+    # Ensure the chart PNG is on disk (idempotent) so the LLM report link works
+    persist_speedpro_charts(date_str, venue, int(race_no), imgs)
     if len(imgs) == 1:
         data = _png_bytes(imgs[0])
         if data:
@@ -750,8 +788,22 @@ def build_llm_report(scored, date_str, venue, race_no) -> str:
         L.append(wpq)
         L.append("")
     if n_img:
-        L.append(f"- SpeedPRO chart images captured on the board: {n_img} "
-                 f"(base64, not embedded in this file)")
+        # Master Rules Task B: never embed raw base64 in the report - persist to
+        # data/speedpro_charts/*.png and insert RELATIVE markdown image links.
+        saved = persist_speedpro_charts(date_str, venue, int(race_no))
+        L.append("")
+        L.append("## SpeedPRO Charts")
+        L.append("")
+        if saved:
+            for p in saved:
+                L.append(f"![SpeedPRO R{race_no}]({p})")
+            L.append("")
+            L.append(f"> {len(saved)} chart image(s) saved under "
+                     f"`data/speedpro_charts/` (relative links above).")
+        else:
+            L.append(f"- {n_img} chart image(s) captured on the board but not "
+                     f"decodable to disk.")
+        L.append("")
     L.append("---")
     L.append("Generated by HKJC Quant Terminal — educational use only.")
     return "\n".join(L)

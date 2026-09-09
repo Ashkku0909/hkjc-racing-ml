@@ -10,6 +10,7 @@ pinned at 0.85 until the pool ACTUALLY freezes.
 import os
 import sys
 import time
+import itertools
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -19,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from web_live import (  # noqa: E402
     execution_state, fusion_weight, t_tilde_seconds, effective_poll_ttl,
-    bayesian_fusion, flag_row, CLOSED_FROZEN_SEC,
+    bayesian_fusion, flag_row, _henery_rank, CLOSED_FROZEN_SEC,
 )
 from modeling.exotics_pricing import henery_gamma_for_field  # noqa: E402
 
@@ -142,6 +143,78 @@ def test_henery_gamma_bounds():
     g = [henery_gamma_for_field(n) for n in range(4, 15)]
     assert all(0.75 - 1e-9 <= x <= 0.88 + 1e-9 for x in g)
     assert all(g[i] <= g[i + 1] + 1e-9 for i in range(len(g) - 1))
+
+
+def _henery_ref(p, r, gamma):
+    """Brute-force recursive Henery chain reference (exact, O(n^r)).
+
+    res[k] = sum over ordered (a1..a_{r-1}) distinct, none == k of
+        p[a1] * prod_{t=2..r-1} g[a_t] / (S - sum_{u<t} g[a_u])
+    (the same chain the original web_live loop enumerated).
+    """
+    p = np.asarray(p, dtype=float)
+    n = len(p)
+    if n < r:
+        return np.full(n, np.nan)
+    if r == 1:
+        return p.copy()
+    g = np.clip(p, 1e-12, 1.0) ** gamma
+    S = float(g.sum())
+    res = np.zeros(n)
+    for k in range(n):
+        others = [i for i in range(n) if i != k]
+        total = 0.0
+        for prefix in itertools.permutations(others, r - 1):
+            # chain: a1 (win prob p[a1]) -> a2 -> ... -> a_{r-1} -> k last,
+            # each conditional draw removes its g from the denominator.
+            denom = S - g[prefix[0]]
+            prob = p[prefix[0]]
+            for a in prefix[1:]:
+                if denom <= 1e-12:
+                    prob = 0.0
+                    break
+                prob *= g[a] / denom
+                denom -= g[a]
+            if denom > 1e-12:
+                prob *= g[k] / denom
+            else:
+                prob = 0.0
+            total += prob
+        res[k] = total
+    return res
+
+
+def test_henery_r3_r4_vectorized_parity():
+    """Vectorized r=3/r=4 must match the recursive Plackett-Luce chain to ~1e-12
+    (Master Rules Task D: zero parity divergence)."""
+    rng = np.random.default_rng(7)
+    worst = 0.0
+    for n in (4, 5, 7, 10, 14):
+        for gamma in (0.75, 0.81, 0.88):
+            for _ in range(6):
+                p = rng.dirichlet(np.ones(n))
+                for r in (1, 2, 3, 4):
+                    fast = _henery_rank(p, r, gamma)
+                    ref = _henery_ref(p, r, gamma)
+                    assert np.allclose(fast, ref, atol=1e-9, rtol=1e-9), \
+                        f"parity break n={n} r={r} gamma={gamma}"
+                    worst = max(worst, float(np.nanmax(np.abs(fast - ref))))
+    assert worst < 1e-9, worst
+    # every exact rank marginal sums to 1 whenever the field can fill the rank
+    p = rng.dirichlet(np.ones(12))
+    for r in (1, 2, 3, 4):
+        assert abs(_henery_rank(p, r).sum() - 1.0) < 1e-9, r
+
+
+def test_henery_extreme_field_edge():
+    """n == r boundaries (trio on a 3-runner field / quartet on 4) must work and
+    short fields must not leak mass via degenerate denominators."""
+    for n, r in ((3, 3), (4, 4), (4, 3), (5, 4)):
+        p = np.array([0.5 / i if i else 0.0 for i in range(1, n + 1)])
+        p = p / p.sum()
+        res = _henery_rank(p, r, 0.81)
+        assert np.isfinite(res).all()
+        assert abs(res.sum() - 1.0) < 1e-9, (n, r)
 
 
 def _run_all():

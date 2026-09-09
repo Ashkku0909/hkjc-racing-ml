@@ -392,7 +392,13 @@ def _apply_pace_adjustment(probs: pd.Series, runner_df) -> tuple:
 
       Pace Meltdown (>= 3 Leaders): front-runner logits -0.15, closers +0.10
       Lone Leader / Slow Bias (exactly 1 Leader): leader logit +0.20
-    Returns (adjusted probs Series, (scenario, n_leaders)).
+      Slow Pace (0 Leaders, HV only): wide-draw (>=8) backmarkers -0.15,
+        inside-rail (<=4) front-runners/pressers +0.10
+
+    Returns (adjusted probs Series, (scenario, n_leaders), adj_array) where
+    adj_array is the EXACT per-runner logit adjustment actually applied
+    (0.0 when untouched) - persisted to the engine-audit trail so the post-race
+    walk-forward can validate the pace rules (Master Rules Task A / §4).
     """
     profiles = _pace_profiles()
 
@@ -405,32 +411,56 @@ def _apply_pace_adjustment(probs: pd.Series, runner_df) -> tuple:
     backmarkers = (styles.isin(['Closer', 'Backmarker'])).to_numpy(dtype=bool)
     front = (styles.isin(['Leader', 'Presser'])).to_numpy(dtype=bool)
     n_lead = int(leaders.sum())
-    p = pd.to_numeric(probs, errors='coerce').to_numpy(dtype=float)
+    p = np.array(pd.to_numeric(probs, errors='coerce').to_numpy(dtype=float),
+                 dtype=float, copy=True)   # writable copy (Arrow views are RO)
     valid = np.isfinite(p)
     scenario = 'NORMAL'
+    adj = np.zeros(len(p), dtype=float)
+
+    # Master Rules Task E: course/rail draw bias scales the raw pace logits.
+    # Multiplier from modeling.course_rail (empirical venue draw stats from the
+    # feature store + optional rail tables); 1.0 neutral when no data.
+    draw = pd.to_numeric(runner_df.get('barrier_draw'), errors='coerce')
+    scale = np.ones(len(p), dtype=float)
+    try:
+        venue_v = (str(pd.Series(runner_df['venue']).iloc[0]).upper()
+                   if 'venue' in runner_df.columns and len(runner_df) else '')
+        from modeling.course_rail import logit_scale
+        for pos in range(len(p)):
+            dv = draw.iloc[pos] if draw is not None else np.nan
+            if pd.isna(dv):
+                continue
+            scale[pos] = logit_scale(venue_v, None, dv, kind='place')
+    except Exception as e:
+        print(f"course-rail scale failed (fallback 1.0): {e}")
+        scale = np.ones(len(p), dtype=float)
+
+    def _apply(a):
+        """Logit-shift then renormalise (only over valid entries).
+        Mutates `a` IN PLACE with the course/rail scale so the returned adj
+        array equals the EXACT logit adjustment actually applied (audit)."""
+        if not np.any(a[valid]):
+            return
+        np.multiply(a, scale, out=a)
+        pv = np.clip(p, 1e-12, 1.0)
+        logit = np.log(pv / (1.0 - pv)) + a
+        p2 = 1.0 / (1.0 + np.exp(-logit))
+        p2[~valid] = np.nan
+        if np.nansum(p2) > 0:
+            p2 = p2 / np.nansum(p2)
+        p[...] = p2
+
     # Master Rule 2 (pace clashing): N_leaders >= 3 -> front-runners clash,
     # positive drift applied to closers/backmarkers.
     if n_lead >= 3:
         scenario = 'MELTDOWN'
         # Master Rules v2.0: backmarkers/closers +0.10, contested leaders -0.15
         adj = np.where(leaders, -0.15, np.where(backmarkers, 0.10, 0.0))
-        if np.any(adj[valid]):
-            pv = np.clip(p, 1e-12, 1.0)
-            logit = np.log(pv / (1.0 - pv)) + adj
-            p = 1.0 / (1.0 + np.exp(-logit))
-            p[~valid] = np.nan
-            if np.nansum(p) > 0:
-                p = p / np.nansum(p)
+        _apply(adj)
     elif n_lead == 1:
         scenario = 'LONE'
         adj = np.where(leaders, 0.20, 0.0)
-        if np.any(adj[valid]):
-            pv = np.clip(p, 1e-12, 1.0)
-            logit = np.log(pv / (1.0 - pv)) + adj
-            p = 1.0 / (1.0 + np.exp(-logit))
-            p[~valid] = np.nan
-            if np.nansum(p) > 0:
-                p = p / np.nansum(p)
+        _apply(adj)
     elif n_lead == 0:
         # Slow pace / zero pace-setters: on the narrow Happy Valley course a
         # hold-up runner parked wide is nearly a death sentence, while an
@@ -442,19 +472,21 @@ def _apply_pace_adjustment(probs: pd.Series, runner_df) -> tuple:
                 is_hv = str(pd.Series(runner_df['venue']).iloc[0]).upper() == 'HV'
             except Exception:
                 is_hv = False
-        draw = pd.to_numeric(runner_df.get('barrier_draw'), errors='coerce')
         if is_hv:
-            dv = draw.to_numpy(dtype=float)
+            dv = draw.to_numpy(dtype=float) if draw is not None else np.full(len(p), np.nan)
             adj = np.where(backmarkers & (dv >= 8.0), -0.15, 0.0)          # wide closer
             adj = np.where(front & (dv >= 1.0) & (dv <= 4.0), adj + 0.10, adj)  # rail front
-            if np.any(adj[valid]):
-                pv = np.clip(p, 1e-12, 1.0)
-                logit = np.log(pv / (1.0 - pv)) + adj
-                p = 1.0 / (1.0 + np.exp(-logit))
-                p[~valid] = np.nan
-                if np.nansum(p) > 0:
-                    p = p / np.nansum(p)
-    return pd.Series(p, index=probs.index), (scenario, n_lead)
+            _apply(adj)
+    return pd.Series(p, index=probs.index), (scenario, n_lead), adj
+
+
+def _market_frozen(sub: pd.DataFrame, frozen_sec: float = CLOSED_FROZEN_SEC) -> bool:
+    """True iff no win quote has changed for frozen_sec (pool truly closed).
+
+    Nominal post times run early (a 13:00 card often starts 13:01+), so a market
+    that is still ticking must NOT be flagged closed - that would discard the
+    final smart-money surge. Only a frozen pool is 'RACE CLOSED'.
+    """
 
 
 def _market_frozen(sub: pd.DataFrame, frozen_sec: float = CLOSED_FROZEN_SEC) -> bool:
@@ -687,68 +719,55 @@ def _henery_rank(p: np.ndarray, r: int, gamma: float = HENERY_GAMMA) -> np.ndarr
     if r == 1:
         return p.copy()
     g = np.power(np.clip(p, 1e-12, 1.0), gamma)
+    S = g.sum()
     res = np.zeros(n)
     if r == 2:
         # vectorized: res[j] = sum_{i != j} p[i] * g[j] / (S - g[i])
-        den_i = np.maximum(g.sum() - g, 1e-12)
+        den_i = np.maximum(S - g, 1e-12)
         term = np.outer(p, g) / den_i[:, None]
         np.fill_diagonal(term, 0.0)
         res = term.sum(axis=0)
     elif r == 3:
-        for k in range(n):
-            s = 0.0
-            for i in range(n):
-                if i == k:
-                    continue
-                s_i = 0.0
-                for jj in range(n):
-                    if jj != i:
-                        s_i += g[jj]
-                if s_i <= 1e-12:
-                    continue
-                for j in range(n):
-                    if j == i or j == k:
-                        continue
-                    s_ij = 0.0
-                    for m in range(n):
-                        if m != i and m != j:
-                            s_ij += g[m]
-                    if s_ij <= 1e-12:
-                        continue
-                    s += p[i] * (g[j] / s_i) * (g[k] / s_ij)
-            res[k] = s
+        # Vectorized exact Henery order-statistic for the 3rd runner.
+        # res[k] = sum_{i!=k} p[i] * g[k] * sum_{j!=i,k} g[j] /
+        #          ((S - g[i]) * (S - g[i] - g[j]))
+        # Define A[i,j] = p[i]*g[j] / ((S-g[i])(S-g[i]-g[j]))  (0 on i==j).
+        # The double sum over i!=k, j!=i,k of A equals
+        #   (total_rowsum) - rowsum[k] - colsum[k]   (diagonal is 0)
+        # and res[k] = g[k] * that.
+        den_i = np.maximum(S - g, 1e-12)
+        den_ij = S - g[:, None] - g[None, :]
+        np.fill_diagonal(den_ij, 1.0)
+        A = (p[:, None] / den_i[:, None]) * (g[None, :] / np.maximum(den_ij, 1e-12))
+        np.fill_diagonal(A, 0.0)
+        rowsum = A.sum(axis=1)
+        colsum = A.sum(axis=0)
+        total = rowsum.sum()
+        res = g * (total - rowsum - colsum)
     elif r == 4:
-        for l in range(n):
-            s = 0.0
-            for i in range(n):
-                if i == l:
-                    continue
-                s_i = 0.0
-                for jj in range(n):
-                    if jj != i:
-                        s_i += g[jj]
-                if s_i <= 1e-12:
-                    continue
-                for j in range(n):
-                    if j == i or j == l:
-                        continue
-                    s_ij = 0.0
-                    for m in range(n):
-                        if m != i and m != j:
-                            s_ij += g[m]
-                    if s_ij <= 1e-12:
-                        continue
-                    for k in range(n):
-                        if k == i or k == j or k == l:
-                            continue
-                        s_ijk = 0.0
-                        for m in range(n):
-                            if m != i and m != j and m != k:
-                                s_ijk += g[m]
-                        if s_ijk <= 1e-12:
-                            continue
-                        s += p[i] * (g[j] / s_i) * (g[k] / s_ij) * (g[l] / s_ijk)
-            res[l] = s
+        # Vectorized exact Henery order-statistic for the 4th runner.
+        # res[l] = g[l] * sum over ordered i!=j!=k!=l of
+        #   p[i]*g[j]*g[k] / ((S-g[i])(S-g[i]-g[j])(S-g[i]-g[j]-g[k]))
+        # Build tensor T[i,j,k] (0 whenever any two indices coincide), then
+        # res[l] = g[l] * (total - Fi[l] - Fj[l] - Fk[l])  where Fi/Fj/Fk are
+        # the sums of entries whose 1st/2nd/3rd index equals l (exact, because
+        # each triple containing l is excluded exactly once by position).
+        den_i = np.maximum(S - g, 1e-12)
+        g3 = g[:, None, None]
+        den12 = S - g[:, None, None] - g[None, :, None]          # (n,n,1)
+        den123 = S - g[:, None, None] - g[None, :, None] - g[None, None, :]
+        T = ((p[:, None, None] / den_i[:, None, None])
+             * (g[None, :, None] / np.maximum(den12, 1e-12))
+             * (g[None, None, :] / np.maximum(den123, 1e-12)))
+        i_eq = np.eye(n, dtype=bool)[:, :, None]                 # i == j
+        j_eq = np.eye(n, dtype=bool)[None, :, :]                  # j == k
+        k_eq = np.eye(n, dtype=bool)[:, None, :]                  # i == k
+        T = np.where(i_eq | j_eq | k_eq, 0.0, T)
+        total = T.sum()
+        Fi = T.sum(axis=(1, 2))   # first index fixed
+        Fj = T.sum(axis=(0, 2))   # second index fixed
+        Fk = T.sum(axis=(0, 1))   # third index fixed
+        res = g * (total - Fi - Fj - Fk)
     return res
 
 
@@ -857,6 +876,27 @@ def _audit_milestone(race_id: str, date_str: str, venue: str, race_no: int,
                     continue
                 flags = [f for f in ('syndicate_steam', 'divergence_trap',
                                      'smart_place_absorption') if bool(r.get(f))]
+                # Machine-readable Master-Rules context (settle_audit.py parses
+                # these): pace scenario, leader count, venue, the EXACT logit
+                # adjustment applied to this runner (rule-impact cohort) and
+                # its draw when present.
+                try:
+                    ps = r.get('pace_scenario')
+                    if ps is not None and not (isinstance(ps, float) and np.isnan(ps)):
+                        flags.insert(0, f"pace={ps}")
+                    nl = r.get('pace_n_leaders')
+                    if nl is not None and not (isinstance(nl, float) and np.isnan(nl)):
+                        flags.insert(1, f"nl={int(nl)}")
+                    flags.insert(2, f"v={venue}")
+                    adj = r.get('pace_adj_logit')
+                    if adj is not None and not (isinstance(adj, float) and np.isnan(adj)) \
+                            and abs(float(adj)) > 1e-12:
+                        flags.insert(3, f"adj={float(adj):+.2f}")
+                    dv = r.get('barrier_draw')
+                    if dv is not None and pd.notna(dv):
+                        flags.insert(4, f"draw={int(dv)}")
+                except Exception:
+                    pass
                 rows.append({
                     'timestamp': datetime.now().isoformat(timespec='seconds'),
                     'epoch': round(now_e, 3),
@@ -1031,8 +1071,9 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
 
     # --- Pace scenario matrix (lagged run-style density; penalise/boost logits) ---
     pace_scn, pace_n = 'NORMAL', 0
+    pace_adj = np.zeros(len(work), dtype=float)
     try:
-        work['true_prob'], (pace_scn, pace_n) = _apply_pace_adjustment(
+        work['true_prob'], (pace_scn, pace_n), pace_adj = _apply_pace_adjustment(
             work['true_prob'], work)
     except Exception as e:
         print(f"pace adjustment failed: {e}")
@@ -1133,6 +1174,10 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
     work['place_ev'] = np.nan
     work['pace_scenario'] = pace_scn
     work['pace_n_leaders'] = pace_n
+    try:
+        work['pace_adj_logit'] = pd.Series(pace_adj, index=work.index)
+    except Exception:
+        work['pace_adj_logit'] = 0.0
     work['smart_place_absorption'] = False
     if probs.notna().sum() >= 2:
         pm = rank_order_probs(probs.to_numpy(dtype=float),
@@ -1160,7 +1205,7 @@ def score_race(live_df, date_str: str, venue: str, race_no: int):
                 'smart_money_score', 'flow_signal',
                 'p_rank1', 'p_rank2', 'p_rank3', 'p_rank4',
                 'p_top2', 'p_top3', 'p_top4', 'place_prob', 'place_ev',
-                'pace_scenario', 'pace_n_leaders',
+                'pace_scenario', 'pace_n_leaders', 'pace_adj_logit',
                 'fused_weight', 'delta_flow', 't_tilde',
                 'syndicate_steam', 'divergence_trap',
                 'smart_place_absorption', 'exec_state']:

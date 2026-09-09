@@ -75,3 +75,9 @@ data/historical_dividends.csv
 data/kelly_sweep_results.csv
 data/odds_snapshots/
 data/walk_forward_preds.csv
+
+# Live engine-audit trail + SpeedPRO chart exports (runtime outputs)
+data/engine_audit_*.csv
+data/speedpro_charts/
+data/rail_settings.csv
+data/settlements/
