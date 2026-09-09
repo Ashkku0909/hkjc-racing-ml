@@ -38,7 +38,7 @@ import web_live
 from web_live import (
     ensure_data_loaded, poll_race, card_size, score_race, flag_row,
     de_vig_market_probs, race_post_time, snap_store, SLOW_TTL,
-    effective_poll_ttl, race_meta,
+    effective_poll_ttl, race_meta, MAX_RACES, DISCOVER_TTL,
 )
 from scraping.live_scraper import _extras_cache
 
@@ -647,25 +647,44 @@ def _min_win_odds(p, tgt: float = 1.15):
 def daily_card_rows(date_str: str, venue: str) -> list:
     """All actionable plays for the day (prime verdicts, non-thin, open races).
 
+    SELF-SEEDING: races without persisted snapshots are polled ONCE with the
+    light scan (no SpeedPRO extras) - real pools only. Cache TTL = DISCOVER_TTL
+    (5 min), refreshed on each card render.
+
     Each entry: tier/conf, race, play (W / P / WP / EX), horse, live odds,
     EV ratios, decay-aware buy thresholds, smart score and reasons."""
     store = snap_store(date_str, venue)
-    if len(store) == 0 or 'race_id' not in store.columns:
-        return []
     nos = set()
     for rid in store['race_id'].dropna().unique():
         m = re.match(rf"{re.escape(date_str)}_Race(\d+)$", str(rid))
         if m:
             nos.add(int(m.group(1)))
+    # Seed races with no snapshot yet (real pools, light scan)
+    empty_run = 0
+    for rn in range(1, MAX_RACES + 1):
+        if rn in nos:
+            continue
+        live = poll_race(date_str, venue, rn, ttl=DISCOVER_TTL, skip_extras=True)
+        if live is not None and len(live) > 0:
+            nos.add(rn)
+            empty_run = 0
+        else:
+            empty_run += 1
+            if empty_run >= 2:
+                break
     picks = []
     for rn in sorted(nos):
-        sub = store[store['race_id'] == f"{date_str}_Race{rn}"]
-        e = pd.to_numeric(sub['epoch'], errors='coerce').max()
-        if pd.isna(e):
-            continue
-        frame = (sub[sub['epoch'] == e]
-                 [['horse_number', 'horse_name', 'win_odds', 'place_odds']].copy())
-        sc = score_race(frame, date_str, venue, rn)
+        live = poll_race(date_str, venue, rn, ttl=DISCOVER_TTL, skip_extras=True)
+        sc = score_race(live, date_str, venue, rn) if live is not None else None
+        if sc is None:
+            # fall back to the latest persisted frame for this race
+            sub = store[store['race_id'] == f"{date_str}_Race{rn}"]
+            e = pd.to_numeric(sub['epoch'], errors='coerce').max()
+            if pd.isna(e):
+                continue
+            frame = (sub[sub['epoch'] == e]
+                     [['horse_number', 'horse_name', 'win_odds', 'place_odds']].copy())
+            sc = score_race(frame, date_str, venue, rn)
         if sc is None or len(sc) == 0 or bool(sc.iloc[0].get('race_closed')):
             continue
         valid = sc[~sc['unposted']]
@@ -795,11 +814,12 @@ def build_daily_card_md(date_str: str, venue: str, picks=None) -> str:
 def render_card(date_str: str, venue: str):
     """Professional daily buy-list summary (cold, snapshot-driven)."""
     st.markdown('<div class="qt-top4 qt-term" style="margin-top:6px;">'
-                '🎯 TODAY\'S BUY LIST — quant signals · real snapshots · cold 60s</div>',
+                '🎯 TODAY\'S BUY LIST — quant signals · real pools · auto-seeded · 5m refresh</div>',
                 unsafe_allow_html=True)
     picks = daily_card_rows(date_str, venue)
     if not picks:
-        st.info("No actionable plays yet — pick race tabs to poll, or wait for pools to open.")
+        st.info("No actionable plays yet — pools may still be unformed (⏳); "
+                "the card auto-polls every 5 minutes and fills as real odds post.")
         return
     n_high = sum(1 for p in picks if p['tier'] == 'HIGH')
     kpi_strip([
@@ -825,7 +845,7 @@ def render_card(date_str: str, venue: str):
                'buy_w', 'buy_p', 's', 'why']].copy()
     show.columns = ['Conf', 'Race', 'Play', 'Horse', 'W odds', 'P odds',
                     'EV (W)', 'EV (P)', 'Buy W ≥', 'Buy P ≥', 'S', 'Why']
-    st.dataframe(show, hide_index=True, use_container_width=True,
+    st.dataframe(show, hide_index=True, width='stretch',
                  column_config={
                      'Horse': st.column_config.TextColumn(width='large'),
                      'Why': st.column_config.TextColumn(width='large')})
@@ -951,7 +971,7 @@ with st.sidebar:
                          index=0 if default_venue == "ST" else 1)
     poll_s = st.select_slider("Active race poll (s)", options=[1, 2], value=1)
     auto = st.checkbox("Auto-refresh", value=True)
-    force = st.button("🔄 Poll Now", type="primary", use_container_width=True)
+    force = st.button("🔄 Poll Now", type="primary", width='stretch')
     st.divider()
     st.caption("Law 1: only the selected race is scraped/inferred per tick.")
     st.caption("Law 2: real snapshots only · ⏳ when a card is unformed (whole field ≤ 1.01).")
@@ -971,7 +991,7 @@ if auto:
 if mode == "🎯 Today's Card":
     st.session_state['qt_active_race'] = None
     header_panel(date_str, venue, None, None,
-                 '<span style="color:#4dabf7;">🎯 DAILY PLAN · COLD · 60s</span>')
+                 '<span style="color:#4dabf7;">🎯 DAILY PLAN · REAL POLL · 5m</span>')
     render_card(date_str, venue)
     st.stop()
 

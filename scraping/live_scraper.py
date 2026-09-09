@@ -718,7 +718,8 @@ async def scrape_speedpro(race_num=1):
         await page.close()
 
 
-async def scrape_live_odds(date_str, venue="S1", race_num=1, time_to_post: Optional[float] = None):
+async def scrape_live_odds(date_str, venue="S1", race_num=1, time_to_post: Optional[float] = None,
+                           skip_extras: bool = False):
     """
     Scrapes live odds from the HKJC betting site.
     Example URL: https://bet.hkjc.com/en/racing/wp/2026-02-28/S1/1
@@ -844,29 +845,36 @@ async def scrape_live_odds(date_str, venue="S1", race_num=1, time_to_post: Optio
         # Add SpeedPRO data and Draw Statistics - cached per race per process
         extras = _extras_cache.get((date_str, venue, int(race_num)))
         if extras is None:
-            try:
-                print(f"Fetching SpeedPRO / FormGuide / WPQ / DrawStats for {venue} R{race_num} (cached)...")
-                speedpro_result, formguide_data, wpq_str, draw_stats = await asyncio.gather(
-                    scrape_speedpro(race_num),
-                    scrape_speedpro_formguide(race_num),
-                    scrape_live_wpq(date_str, venue, race_num),
-                    scrape_draw_statistics(race_num)
-                )
-                speedpro_data, speedpro_images = speedpro_result
-                extras = {
-                    'speedpro_energy': speedpro_data,
-                    'formguide_remarks': formguide_data,
-                    'draw_win_pct': {int(k): v.get('draw_win_pct') for k, v in draw_stats.items()},
-                    'draw_place_pct': {int(k): v.get('draw_place_pct') for k, v in draw_stats.items()},
-                    'wpq_str': wpq_str,
-                    'speedpro_images': speedpro_images,
-                }
-                _extras_cache[(date_str, venue, int(race_num))] = extras
-            except Exception as e:
-                print(f"Skipping extra sources due to error: {e}")
+            if skip_extras:
+                # Light card scan (Today's Buy-List): do NOT pay the 4-page
+                # SpeedPRO/FormGuide/WPQ/DrawStats gather for every race.
                 extras = {'speedpro_energy': {}, 'formguide_remarks': {},
                           'draw_win_pct': {}, 'draw_place_pct': {},
                           'wpq_str': '', 'speedpro_images': []}
+            else:
+                try:
+                    print(f"Fetching SpeedPRO / FormGuide / WPQ / DrawStats for {venue} R{race_num} (cached)...")
+                    speedpro_result, formguide_data, wpq_str, draw_stats = await asyncio.gather(
+                        scrape_speedpro(race_num),
+                        scrape_speedpro_formguide(race_num),
+                        scrape_live_wpq(date_str, venue, race_num),
+                        scrape_draw_statistics(race_num)
+                    )
+                    speedpro_data, speedpro_images = speedpro_result
+                    extras = {
+                        'speedpro_energy': speedpro_data,
+                        'formguide_remarks': formguide_data,
+                        'draw_win_pct': {int(k): v.get('draw_win_pct') for k, v in draw_stats.items()},
+                        'draw_place_pct': {int(k): v.get('draw_place_pct') for k, v in draw_stats.items()},
+                        'wpq_str': wpq_str,
+                        'speedpro_images': speedpro_images,
+                    }
+                    _extras_cache[(date_str, venue, int(race_num))] = extras
+                except Exception as e:
+                    print(f"Skipping extra sources due to error: {e}")
+                    extras = {'speedpro_energy': {}, 'formguide_remarks': {},
+                              'draw_win_pct': {}, 'draw_place_pct': {},
+                              'wpq_str': '', 'speedpro_images': []}
 
         df['speedpro_energy'] = df['horse_name'].map(
             lambda name: extras['speedpro_energy'].get(name.upper()))

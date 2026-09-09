@@ -175,13 +175,16 @@ def de_vig_market_probs(win_odds: pd.Series) -> pd.Series:
     return out
 
 
-def poll_race(date_str: str, venue: str, race_no: int, ttl: float):
+def poll_race(date_str: str, venue: str, race_no: int, ttl: float,
+              skip_extras: bool = False):
     """Real poll with per-race TTL + SINGLE-FLIGHT: concurrent reruns share the
     same in-flight scrape instead of stacking duplicate browser sessions.
 
     LOW-LATENCY: while a scrape is already in flight, reruns serve the LAST
     GOOD frame immediately instead of blocking on the network (the in-flight
     call is the only one that waits, and it refreshes the cache on completion).
+    skip_extras=True is the light scan used by the Today's Buy-List (no
+    SpeedPRO/FormGuide/WPQ/DrawStats gather per race).
     """
     key = (date_str, venue, race_no)
     now = time.time()
@@ -197,7 +200,7 @@ def poll_race(date_str: str, venue: str, race_no: int, ttl: float):
         except Exception:
             return hit[1] if hit is not None else None
 
-    fut = run_async(scrape_live_odds(date_str, venue, race_no))
+    fut = run_async(scrape_live_odds(date_str, venue, race_no, skip_extras=skip_extras))
     _inflight[key] = (now, fut)
     try:
         df = fut.result(timeout=SCRAPE_TIMEOUT)
